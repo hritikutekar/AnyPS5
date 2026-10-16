@@ -40,3 +40,6 @@
 [submodule "3rdparty/mbedtls"]
 	path = 3rdparty/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
+[submodule "3rdparty/vgmstream"]
+	path = 3rdparty/vgmstream
+	url = https://github.com/vgmstream/vgmstream.git
