@@ -382,6 +382,7 @@ constexpr int AT9_MULTICHANNEL_BLOCK_OVERRUN = 0x7F000001;
 
 int DecodeAt9Frame(Instance& instance, const std::uint8_t* data, int size, std::uint8_t* pcm, std::uint32_t encoding, std::size_t sampleBytes, int* used) {
     if (instance.vibrationDecoder) {
+        if (encoding > 2) NotImplemented_nid_no_patch("AJM ATRAC9 vibration PCM encoding other than PCM16, PCM32 and float");
         int samples = 0;
         if (encoding == 0) samples = atrac9_decode_pcm16(instance.vibrationDecoder, data, size, reinterpret_cast<std::int16_t*>(pcm), used);
         else if (encoding == 2) samples = atrac9_decode_float(instance.vibrationDecoder, data, size, reinterpret_cast<float*>(pcm), used);
