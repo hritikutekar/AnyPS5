@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -1281,9 +1282,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             result.dualSourceBlend = true;
         }
         if (const auto info = read(cx, 0x31c + slot * 0xfu); state.blendEnable && (info & 0x8000u) == 0 && ((info >> 8u) & 7u) <= 1u) {
-            char detail[80];
-            std::snprintf(detail, sizeof(detail), " (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x)", info, slot, blend);
-            throw std::runtime_error(std::string("AGC graphics: blending unclamped normalized color is not implemented") + detail);
+            // Yotei: blending unclamped normalized color is not implemented; PPSA26344 does it (CB_COLOR_INFO
+            // 0x0000000c) a few minutes in. Draw it clamped, warned once: Vulkan clamps the source to [0, 1]
+            // before blending into a UNORM/SNORM target where the hardware would not. Approximate.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                std::fprintf(stderr, "[yotei] blending unclamped normalized color drawn clamped (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x); approximate\n", info, slot, blend);
+            }
         }
         result.blends[color.exportIndex] = state;
     }
