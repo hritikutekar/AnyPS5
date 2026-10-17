@@ -1640,8 +1640,21 @@ int APS5_VABI sceAjmDecAt9ParseConfigData(const void* config_data, AjmDecAt9Conf
     std::uint8_t config[ATRAC9_CONFIG_DATA_SIZE];
     std::memcpy(config, config_data, sizeof(config));
     Atrac9CodecInfo info{};
-    const bool valid = DescribeAt9Config(config, info);
-    AJM_TRACE("[ajm] parse config %02x %02x %02x %02x -> %s, %d channels, %d Hz, superframe %d bytes (%d frames of %d samples)\n", config[0], config[1], config[2], config[3], valid ? "ok" : "invalid", info.channels, info.samplingRate, info.superframeSize, info.framesInSuperframe, info.frameSamples);
+    bool valid = DescribeAt9Config(config, info);
+    // Ghost of Yotei (PPSA26344) parses fe 7e 03 f0 (channel configuration 7, reserved) and divides by the
+    // superframe sample count it gets back; a failure leaves its block size 0 and it faults (SIGFPE). Before
+    // LibAtrac9 rejected configurations 6 and 7, this parse succeeded with 0 channels. Report that again: the
+    // sample rate and frame layout do not depend on the channel configuration, so read them with configuration
+    // 0. Creating a decoder from such config data still fails.
+    const bool reservedChannels = !valid && config[0] == 0xFE && (config[1] & 1u) == 0 && ((config[1] >> 1) & 7u) > 5;
+    if (reservedChannels) {
+        std::uint8_t mono[ATRAC9_CONFIG_DATA_SIZE];
+        std::memcpy(mono, config, sizeof(mono));
+        mono[1] = static_cast<std::uint8_t>(mono[1] & ~0x0Eu);
+        valid = DescribeAt9Config(mono, info);
+        info.channels = 0;
+    }
+    AJM_TRACE("[ajm] parse config %02x %02x %02x %02x -> %s, %d channels, %d Hz, superframe %d bytes (%d frames of %d samples)\n", config[0], config[1], config[2], config[3], valid ? (reservedChannels ? "ok (reserved channel configuration)" : "ok") : "invalid", info.channels, info.samplingRate, info.superframeSize, info.framesInSuperframe, info.frameSamples);
     if (!valid) return SCE_AJM_ERROR_INVALID_PARAMETER;
     config_info->channels = static_cast<std::uint32_t>(info.channels);
     config_info->sample_rate = static_cast<std::uint32_t>(info.samplingRate);
