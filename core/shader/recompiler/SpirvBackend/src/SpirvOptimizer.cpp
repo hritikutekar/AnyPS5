@@ -208,6 +208,9 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     options.set_preserve_bindings(true);
     options.set_preserve_spec_constants(!specialize);
     options.set_validator_options(validatorOptions);
+    // The input was validated above; Optimizer::Run would validate it again (run_validator defaults to true),
+    // which on the largest compute programs is minutes of dominator walks per variant.
+    options.set_run_validator(false);
     std::vector<std::uint32_t> optimized;
     diagnostics.clear();
     if (!optimizer.Run(spirv.data(), spirv.size(), &optimized, options)) {
