@@ -1852,6 +1852,32 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+// APS5_PROFILE_DRAW: storage refreshes by outcome (nothing to flush, alias borrowed, a same-shape
+// alias rejected and why, or how the other pending image differs), as a [storage-refresh] line
+// every 10 s with the most frequent kinds first.
+void NoteRefreshOutcome(bool flushed, bool borrowed, const char* aliasRejected, const std::string& overlapKind) {
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> counts;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::string key;
+    if (!flushed) key = borrowed ? "borrowed, nothing else to flush" : "nothing to flush";
+    else if (borrowed) key = "borrowed alias, flushed others";
+    else if (aliasRejected != nullptr) key = std::string("flushed: same-shape alias rejected (") + aliasRejected + ")";
+    else key = "flushed: " + overlapKind;
+    std::lock_guard lock(mutex);
+    ++counts[key];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    // Kinds with their size details folded into one line each, top 8 by count.
+    std::vector<std::pair<std::string, std::uint64_t>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string line = "[storage-refresh] (10 s)";
+    for (std::size_t index = 0; index < sorted.size() && index < 8; ++index) line += (index == 0 ? " " : "; ") + std::to_string(sorted[index].second) + " " + sorted[index].first;
+    std::fprintf(stderr, "%s\n", line.c_str());
+    counts.clear();
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1880,20 +1906,67 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    // APS5_PROFILE_DRAW diagnostic: why a refresh that flushes did not borrow an alias instead
+    // (reported every 10 s as a [storage-refresh] line).
+    const char* aliasRejected = alias == nullptr ? nullptr : "";
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) {
+        aliasRejected = "keys or no import";
+        alias = nullptr;
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) {
+            aliasRejected = "changed blocks unknown";
+            alias = nullptr;
+        }
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
             if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+                aliasRejected = "unit state";
                 alias = nullptr;
                 break;
             }
         }
     }
+    std::string overlapKind;
+    if (profile && alias == nullptr && aliasRejected == nullptr) {
+        // No same-shape alias: name how the first other pending image over this memory differs.
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto begin = descriptor.baseAddress;
+        const auto end = begin + guestBytes;
+        for (auto* texture : pending.textures) {
+            if (texture == this) continue;
+            const auto& theirs = texture->descriptor;
+            const auto theirEnd = theirs.baseAddress + texture->guestBytes;
+            if (theirs.baseAddress >= end || begin >= theirEnd) continue;
+            if (theirs.baseAddress != begin || texture->guestBytes != guestBytes) {
+                overlapKind = theirs.baseAddress <= begin && theirEnd >= end ? "other range containing it" : theirs.baseAddress >= begin && theirEnd <= end ? "other range inside it" : "partly overlapping range";
+            } else if (!texture->blockUnits || !blockUnits) {
+                overlapKind = "same range, untracked units";
+            } else if (theirs.width != descriptor.width || theirs.height != descriptor.height) {
+                overlapKind = "same range, other size";
+            } else if (BytesPerElement(theirs.format) != BytesPerElement(descriptor.format)) {
+                overlapKind = "same range, other element size";
+            } else if (theirs.tileMode != descriptor.tileMode) {
+                overlapKind = "same range, other tiling";
+            } else if (theirs.mipCount != descriptor.mipCount) {
+                overlapKind = "same range, other mip count";
+            } else if (!texture->Cached() || texture->uploadedKeys != DccKeys::Uncompressed) {
+                overlapKind = "same shape, alias compressed or uncached";
+            } else {
+                overlapKind = "same range, other dimension or layers";
+            }
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), " (%ux%u fmt %u tile %u mips %u vs %ux%u fmt %u tile %u mips %u)", descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, theirs.width, theirs.height, static_cast<unsigned>(theirs.format), static_cast<unsigned>(theirs.tileMode), theirs.mipCount);
+            overlapKind += detail;
+            break;
+        }
+        if (overlapKind.empty()) overlapKind = "no other pending image (own or flushing)";
+    }
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    if (profile) NoteRefreshOutcome(flushed, alias != nullptr, aliasRejected, overlapKind);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
