@@ -619,7 +619,22 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
         const char* text = std::getenv("APS5_BDA_STOP_WORD_LIMIT");
         return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{400000};
     }();
-    if (stopWordLimit != 0 && result.spirv.size() > stopWordLimit && !targetOptions.bdaContinueWaveOperations) {
+    // APS5_BDA_STOP=<hex address>[,...]: the named programs keep the #6416 masks whatever their size.
+    static const std::vector<std::uint64_t> alwaysStopping = [] {
+        std::vector<std::uint64_t> addresses;
+        if (const char* text = std::getenv("APS5_BDA_STOP")) {
+            for (const char* at = text; *at != '\0';) {
+                char* end = nullptr;
+                const auto address = std::strtoull(at, &end, 16);
+                if (end == at) break;
+                addresses.push_back(address);
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return addresses;
+    }();
+    const bool keepMasks = std::find(alwaysStopping.begin(), alwaysStopping.end(), request.shader.codeAddress) != alwaysStopping.end();
+    if (stopWordLimit != 0 && !keepMasks && result.spirv.size() > stopWordLimit && !targetOptions.bdaContinueWaveOperations) {
         targetOptions.bdaContinueWaveOperations = true;
         auto continued = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
         if (continued.size() < result.spirv.size()) {
