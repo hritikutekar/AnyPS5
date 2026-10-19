@@ -307,6 +307,26 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    // APS5_BDA_CONTINUE=<hex address>[,...]: the named programs keep the older fix when they use
+    // wave-level operations (a faulting read continues with zero instead of stopping the invocation),
+    // for giant programs whose #6416 write masks are too expensive to compile (0x800029c200 runs
+    // RADV out of memory). Every other program stops faulting invocations.
+    if (state.bdaStopsInvocations && (state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) {
+        static const std::vector<std::uint64_t> continuing = [] {
+            std::vector<std::uint64_t> addresses;
+            if (const char* text = std::getenv("APS5_BDA_CONTINUE")) {
+                for (const char* at = text; *at != '\0';) {
+                    char* end = nullptr;
+                    const auto address = std::strtoull(at, &end, 16);
+                    if (end == at) break;
+                    addresses.push_back(address);
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return addresses;
+        }();
+        if (std::find(continuing.begin(), continuing.end(), target.programAddress) != continuing.end()) state.bdaStopsInvocations = false;
+    }
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);

@@ -27,6 +27,8 @@ struct SpirvTargetOptions {
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
     bool bindlessImages = false;
+    // The program's code address (APS5_BDA_CONTINUE names programs by it).
+    std::uint64_t programAddress = 0;
 };
 
 struct SpirvEmitInfo {

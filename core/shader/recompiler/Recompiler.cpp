@@ -592,6 +592,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
     targetOptions.bindlessImages = request.target.bindlessImages;
+    targetOptions.programAddress = request.shader.codeAddress;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
