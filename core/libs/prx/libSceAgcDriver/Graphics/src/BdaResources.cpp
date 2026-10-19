@@ -140,6 +140,15 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    if (BufferAddressHistory::Enabled()) {
+        // APS5_BUFFER_VA_HISTORY diagnostic: every table, fresh or the cached address space's, is
+        // checked for an entry outside the device's buffer range (0xffff8... here).
+        static std::atomic<int> reported{0};
+        for (const auto& range : ranges) {
+            if ((range.deviceAddress >> 47u) == 0x1ffffu || reported.fetch_add(1, std::memory_order_relaxed) >= 40) continue;
+            std::fprintf(stderr, "[bad-bda] %s table entry 0x%llx-0x%llx -> device 0x%llx (permissions %u, space serial %llu, %zu ranges)\n", cached.has_value() ? "cached-space" : "built", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), range.permissions, static_cast<unsigned long long>(serial), ranges.size());
+        }
+    }
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
