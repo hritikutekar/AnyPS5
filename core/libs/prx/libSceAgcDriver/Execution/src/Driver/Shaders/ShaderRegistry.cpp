@@ -596,6 +596,18 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
         require(result == nullptr || result->type == snapshot->type, "registered program has ambiguous shader binary types");
         result = snapshot;
     }
+    if (registered && result == nullptr) {
+        // yotei diagnostic: which program, which types were asked for, which are registered.
+        std::string wanted, held;
+        for (const auto type : types) wanted += " " + std::to_string(type);
+        for (const auto& snapshot : found->second) {
+            if (address - snapshot->codeAddress >= snapshot->code.size() * sizeof(std::uint32_t)) continue;
+            char text[96];
+            std::snprintf(text, sizeof(text), " type %u (code 0x%llx, header 0x%llx)", static_cast<unsigned>(snapshot->type), static_cast<unsigned long long>(snapshot->codeAddress), static_cast<unsigned long long>(snapshot->headerAddress));
+            held += text;
+        }
+        std::fprintf(stderr, "[registry] program 0x%llx asked as types%s, registered as%s\n", static_cast<unsigned long long>(address), wanted.c_str(), held.c_str());
+    }
     require(!registered || result != nullptr, "registered program refers to an incompatible shader binary type");
     return result;
 }
@@ -1434,7 +1446,14 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     }
     DrawDecode decoded{};
     decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
-    DecodeGraphicsPrograms(decoded, state, *registry, true, false);
+    try {
+        DecodeGraphicsPrograms(decoded, state, *registry, true, false);
+    } catch (const MergedHullUnsupported& error) {
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[gpu] prim state with merged hull 0x%llx: stage preparation skipped (%s)\n", static_cast<unsigned long long>(error.address), error.what());
+        transaction.Commit();
+        return;
+    }
     auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
     for (auto& stage : prepared) {
         const auto& entries = transaction.Read(*stage.snapshot).entries;

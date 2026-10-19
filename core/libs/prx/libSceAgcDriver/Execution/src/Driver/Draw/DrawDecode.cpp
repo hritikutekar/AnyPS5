@@ -96,6 +96,17 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         };
         const auto& graphics = product->state;
         if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
+            static const bool skipMergedHull = std::getenv("APS5_NO_SKIP_MERGED_HULL") == nullptr;
+            if (skipMergedHull && (!staticAbi || programAddress(0x148) != 0)) {
+                const auto local = programAddress(0x148);
+                if (const auto found = registry.upper_bound(local); found != registry.begin()) {
+                    const auto& snapshots = std::prev(found)->second;
+                    const auto covers = [&](const auto& snapshot) { return local - snapshot->codeAddress < snapshot->code.size() * sizeof(std::uint32_t); };
+                    const bool merged = std::ranges::any_of(snapshots, [&](const auto& snapshot) { return covers(snapshot) && snapshot->type == 3; });
+                    const bool front = std::ranges::any_of(snapshots, [&](const auto& snapshot) { return covers(snapshot) && snapshot->type == 5; });
+                    if (merged && !front) throw MergedHullUnsupported(local);
+                }
+            }
             if (!staticAbi || programAddress(0x148) != 0) append(0x148, 5, Stage::Local, 0x10b, 0x10c, Role::Local);
             append(0x108, 7, Stage::TessellationControl, 0x10b, 0x10c, Role::Hull);
             InitializeMerged(queue, programs.back(), 0x102, true, staticAbi);

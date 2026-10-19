@@ -187,7 +187,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         decode = std::move(refreshed);
     }
-    resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    try {
+        resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    } catch (const MergedHullUnsupported& error) {
+        static std::atomic<std::uint64_t> skipped{0};
+        const auto count = skipped.fetch_add(1) + 1;
+        if (count == 1 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] skipped %llu draws with merged hull 0x%llx (tessellation of merged LS+HS programs is not supported yet)\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(error.address));
+        return drawn();
+    }
     const auto& graphics = decode->state;
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;

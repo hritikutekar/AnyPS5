@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
@@ -39,6 +40,15 @@ struct DrawDecode {
     ShaderRecompiler::ShaderPixelStageInfo pixel;
     std::vector<DrawProgram> programs;
     std::vector<ShaderRecompiler::ProgramRole> roles;
+};
+
+// A tessellation stage set whose LS slot holds a whole merged LS+HS program (binary type Hs, 3) rather
+// than the HsFront/HsBack halves the tessellation path decodes. Not supported yet: the static ABI skips
+// its preparation and draws using it are skipped (yotei workaround, APS5_NO_SKIP_MERGED_HULL=1 restores
+// the abort).
+struct MergedHullUnsupported : std::runtime_error {
+    std::uint64_t address;
+    explicit MergedHullUnsupported(std::uint64_t program) : std::runtime_error("graphics program is a merged LS+HS hull (binary type 3), which tessellation does not support yet"), address(program) {}
 };
 
 void ReadUserWords(const QueueState& queue, DrawProgram& program, bool staticAbi);
