@@ -29,6 +29,8 @@ struct SpirvTargetOptions {
     bool bindlessImages = false;
     // The program's code address (APS5_BDA_CONTINUE names programs by it).
     std::uint64_t programAddress = 0;
+    // Faulting reads continue with zero in wave-operation programs (the older fix) instead of stopping the invocation.
+    bool bdaContinueWaveOperations = false;
 };
 
 struct SpirvEmitInfo {

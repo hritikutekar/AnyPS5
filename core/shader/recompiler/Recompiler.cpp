@@ -612,6 +612,21 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
         targetOptions.registrationModules = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
+    // A wave-operation program whose #6416 write masks leave it over APS5_BDA_STOP_WORD_LIMIT words
+    // (default 400000; 0 = no limit) is emitted again with the older faulting-read fix: RADV's NIR
+    // optimization of the masked giants (0x800029c200, 0x800028a800) runs out of memory.
+    static const std::size_t stopWordLimit = [] {
+        const char* text = std::getenv("APS5_BDA_STOP_WORD_LIMIT");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{400000};
+    }();
+    if (stopWordLimit != 0 && result.spirv.size() > stopWordLimit && !targetOptions.bdaContinueWaveOperations) {
+        targetOptions.bdaContinueWaveOperations = true;
+        auto continued = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+        if (continued.size() < result.spirv.size()) {
+            std::fprintf(stderr, "[bda-continue] 0x%llx: %zu -> %zu SPIR-V words without the faulting-read masks\n", static_cast<unsigned long long>(request.shader.codeAddress), result.spirv.size(), continued.size());
+            result.spirv = std::move(continued);
+        }
+    }
     result.registrationModule = registration;
     result.bindlessHeap = request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     if (result.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(program.Info(), program.Resources().stage);

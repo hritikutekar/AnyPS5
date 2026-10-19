@@ -325,7 +325,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
             }
             return addresses;
         }();
-        if (std::find(continuing.begin(), continuing.end(), target.programAddress) != continuing.end()) state.bdaStopsInvocations = false;
+        if (target.bdaContinueWaveOperations || std::find(continuing.begin(), continuing.end(), target.programAddress) != continuing.end()) state.bdaStopsInvocations = false;
     }
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
