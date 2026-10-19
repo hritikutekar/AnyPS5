@@ -4,6 +4,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "prx/libSceAgcDriver/Graphics/include/BufferAddressHistory.hpp"
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <cstdint>
@@ -66,6 +67,7 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
     for (const auto& address : addresses) {
         std::snprintf(line, sizeof(line), "[device-fault] %s at 0x%llx (precision 0x%llx)", DeviceFaultAddressKind(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
         lines.emplace_back(line);
+        for (auto& owner : Graphics::BufferAddressHistory::Describe(address.reportedAddress)) lines.push_back(std::move(owner));
     }
     for (const auto& vendor : vendors) {
         std::snprintf(line, sizeof(line), "[device-fault] vendor: %s (code 0x%llx, data 0x%llx)", DeviceFaultText(vendor.description).c_str(), static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));

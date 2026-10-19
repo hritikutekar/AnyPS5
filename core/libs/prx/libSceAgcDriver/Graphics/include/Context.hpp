@@ -4,6 +4,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "prx/libSceAgcDriver/Graphics/include/BufferAddressHistory.hpp"
 #include <mutex>
 #include <vulkan/vulkan.h>
 #include <atomic>
@@ -251,7 +252,7 @@ struct Context {
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        const auto function = reinterpret_cast<TFunction>(BufferAddressHistory::Hook(name, deviceProc(device, name)));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
     }
