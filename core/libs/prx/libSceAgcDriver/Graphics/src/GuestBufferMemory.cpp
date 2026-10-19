@@ -192,8 +192,27 @@ struct ImportFailure {
 
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
-struct HostImports {
+// The imports mutex knows which thread holds it: importing can run the unwatch hook
+// (StorageTexture::SaveBeforeUnwatch), which asks HostImportFor again on the same thread.
+class ImportsMutex {
+public:
+    void lock() {
+        mutex.lock();
+        owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    }
+    void unlock() {
+        owner.store(std::thread::id{}, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+    [[nodiscard]] bool HeldByThisThread() const { return owner.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+
+private:
     std::mutex mutex;
+    std::atomic<std::thread::id> owner{};
+};
+
+struct HostImports {
+    ImportsMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
@@ -2735,6 +2754,8 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();
+    // Re-entered from an import this thread is making: answer from the imports already made.
+    if (state.mutex.HeldByThisThread()) return findImport(state, address, address + bytes);
     std::lock_guard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
