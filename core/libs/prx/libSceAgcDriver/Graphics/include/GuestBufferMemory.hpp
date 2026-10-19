@@ -454,6 +454,7 @@ private:
     void addCopiedRange(const CopiedRange& range, const GuestMemory::Commitment* known = nullptr);
     // The BDA table entry of an uploaded region.
     static ShaderRecompiler::BdaAbi::Range addressRange(const Region& region);
+    void checkAddressRanges(std::span<const ShaderRecompiler::BdaAbi::Range> spaceRanges) const;
     static std::uint64_t servedEnd(const Region& region);
     static std::uint64_t inPlaceEnd(const Region& region);
     void validate(std::uint64_t address, std::size_t bytes) const;

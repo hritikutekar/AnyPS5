@@ -4575,6 +4575,44 @@ ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& re
     return {region.begin, region.direct != nullptr ? inPlaceEnd(region) : servedEnd(region), address, permissions, 0};
 }
 
+// APS5_BUFFER_VA_HISTORY diagnostic: a page-table entry whose device address lies below the device's
+// buffer range (every buffer this device hands out is at 0xffff8... here) points at no buffer, and the
+// first ones are logged with where they came from: a region (and its import, still in the imports map
+// or not) or the cached address space.
+void GuestBufferMemory::checkAddressRanges(std::span<const ShaderRecompiler::BdaAbi::Range> spaceRanges) const {
+    if (!BufferAddressHistory::Enabled()) return;
+    static std::atomic<int> reported{0};
+    const auto bad = [](std::uint64_t address) { return (address >> 47u) != 0x1ffffu; };
+    const auto report = [&](const char* text) {
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 40) std::fprintf(stderr, "%s\n", text);
+    };
+    char line[400];
+    for (const auto& region : regions) {
+        const auto range = addressRange(region);
+        if (!bad(range.deviceAddress)) continue;
+        bool live = false;
+        if (region.direct != nullptr) {
+            auto& state = Imports();
+            const bool held = state.mutex.HeldByThisThread();
+            std::unique_lock<ImportsMutex> lock(state.mutex, std::defer_lock);
+            if (!held) lock.lock();
+            for (const auto& [base, entry] : state.imports) {
+                if (&entry == region.direct) {
+                    live = true;
+                    break;
+                }
+            }
+        }
+        std::snprintf(line, sizeof(line), "[bad-bda] region 0x%llx-0x%llx -> device 0x%llx: %s%s%s, import record %p %s (base 0x%llx bytes 0x%llx address 0x%llx), overlay %d sparse %d", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), region.direct != nullptr ? "direct" : "", region.mirror != nullptr ? "mirror" : "", region.buffer != nullptr ? "buffer" : "", static_cast<const void*>(region.direct), region.direct == nullptr ? "-" : live ? "LIVE" : "NOT IN THE IMPORTS MAP", region.direct != nullptr ? static_cast<unsigned long long>(region.direct->base) : 0ull, region.direct != nullptr ? static_cast<unsigned long long>(region.direct->bytes) : 0ull, region.direct != nullptr ? static_cast<unsigned long long>(region.direct->address) : 0ull, region.overlay ? 1 : 0, region.sparse ? 1 : 0);
+        report(line);
+    }
+    for (const auto& range : spaceRanges) {
+        if (!bad(range.deviceAddress)) continue;
+        std::snprintf(line, sizeof(line), "[bad-bda] address-space range 0x%llx-0x%llx -> device 0x%llx (space epoch %llu, imports epoch %llu)", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end), static_cast<unsigned long long>(range.deviceAddress), space != nullptr ? static_cast<unsigned long long>(space->importsEpoch) : 0ull, static_cast<unsigned long long>(Imports().epoch));
+        report(line);
+    }
+}
+
 std::uint64_t GuestBufferMemory::servedEnd(const Region& region) {
     if (region.mirror != nullptr) return std::min(region.end, region.mirror->base + region.mirror->bytes);
     return region.bufferEnd != 0 ? region.bufferEnd : region.end;
@@ -4586,6 +4624,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     std::vector<ShaderRecompiler::BdaAbi::Range> overlays;
     result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
     for (const auto& region : regions) (region.overlay ? overlays : result).push_back(addressRange(region));
+    checkAddressRanges(space != nullptr ? std::span<const ShaderRecompiler::BdaAbi::Range>(space->ranges) : std::span<const ShaderRecompiler::BdaAbi::Range>());
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> combined;
         combined.reserve(result.size() + space->ranges.size());
