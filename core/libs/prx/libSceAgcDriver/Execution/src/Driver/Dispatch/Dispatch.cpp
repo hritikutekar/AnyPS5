@@ -135,7 +135,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments, bool forceFresh) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (address == SkippedShader() && address != 0) return;
+    if (IsSkippedShader(address)) return;
     struct OriginScope {
         explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
