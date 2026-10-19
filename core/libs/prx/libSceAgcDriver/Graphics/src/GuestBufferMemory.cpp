@@ -288,11 +288,44 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
-void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+// Why an import retired (each retirement bumps the epoch and so invalidates the cached address
+// space); counted and reported every 10 s as an [import-retire] line.
+enum class RetireReason : std::uint8_t { Evicted, Replaced, Remapped, Released, Unmapped, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RetireReason::Count)> RetireReasonNames{"evicted (budget LRU)", "replaced by a wider import", "registration changed", "guest memory change (before GPU sync)", "guest memory change (after GPU sync)"};
+
+void countRetire(RetireReason reason, const HostImport& entry) {
+    struct Counts {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t lastBase = 0;
+        std::uint64_t lastBytes = 0;
+    };
+    static std::array<Counts, static_cast<std::size_t>(RetireReason::Count)> counts{};
+    static auto lastReport = std::chrono::steady_clock::now();
+    auto& slot = counts[static_cast<std::size_t>(reason)];
+    ++slot.count;
+    slot.bytes += entry.bytes;
+    slot.lastBase = entry.base;
+    slot.lastBytes = entry.bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string line = "[import-retire] (10 s)";
+    for (std::size_t index = 0; index < counts.size(); ++index) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "%s %s: %llu (%llu MiB, last 0x%llx+0x%llx)", index == 0 ? "" : ";", RetireReasonNames[index], static_cast<unsigned long long>(counts[index].count), static_cast<unsigned long long>(counts[index].bytes >> 20u), static_cast<unsigned long long>(counts[index].lastBase), static_cast<unsigned long long>(counts[index].lastBytes));
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    counts = {};
+}
+
+void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, RetireReason reason, bool hold = true) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
+    countRetire(reason, it->second);
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
@@ -987,7 +1020,7 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
         }
         if (oldest == state.imports.end()) break;
         freed += oldest->second.bytes;
-        retireImport(context.device, state, oldest, lease);
+        retireImport(context.device, state, oldest, lease, RetireReason::Evicted);
     }
     return freed;
 }
@@ -1148,7 +1181,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireReason::Replaced);
         it = next;
     }
     if (state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
@@ -1326,7 +1359,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         if (trace && leasedRangeOwner(lease, it->first, it->first + it->second.bytes) != nullptr) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired: the range was mapped again\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second.bytes));
         const auto next = std::next(it);
-        retireImport(context.device, state, it, lease);
+        retireImport(context.device, state, it, lease, RetireReason::Remapped);
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
@@ -2192,7 +2225,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                         continue;
                     }
                     const auto next = std::next(it);
-                    retireImport(imports.device, imports, it, lease, false);
+                    retireImport(imports.device, imports, it, lease, RetireReason::Released, false);
                     it = next;
                     retiredImport = true;
                 }
@@ -2262,7 +2295,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
                             continue;
                         }
                         const auto next = std::next(it);
-                        retireImport(imports.device, imports, it, lease, false);
+                        retireImport(imports.device, imports, it, lease, RetireReason::Unmapped, false);
                         it = next;
                         retiredImport = true;
                     }
