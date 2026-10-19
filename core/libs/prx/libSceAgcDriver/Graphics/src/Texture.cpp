@@ -1909,6 +1909,31 @@ void NoteRefreshOutcome(bool flushed, bool borrowed, const char* aliasRejected, 
     counts.clear();
 }
 
+// APS5_PROFILE_DRAW: FlushPending's waits for the pending writer by flush reason, wait kind and why
+// it was not deferred, as a [flush-wait] line every 10 s (most waited first).
+void NoteFlushWait(const char* reason, const char* kind, const char* why, double ms) {
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<std::uint64_t, double>> waits;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& slot = waits[std::string(reason != nullptr ? reason : "?") + " / " + kind + " / " + why];
+    ++slot.first;
+    slot.second += ms;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::vector<std::pair<std::string, std::pair<std::uint64_t, double>>> sorted(waits.begin(), waits.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    std::string line = "[flush-wait] (10 s)";
+    for (std::size_t index = 0; index < sorted.size() && index < 8; ++index) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %llu waits %.0f ms", static_cast<unsigned long long>(sorted[index].second.first), sorted[index].second.second);
+        line += (index == 0 ? "" : ";") + std::string(text) + ": " + sorted[index].first;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    waits.clear();
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3631,11 +3656,26 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (auto* recorder = Recorder::Active(); !deferWriter && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
+            const auto waitStart = std::chrono::steady_clock::now();
+            const char* kind = nullptr;
             if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
                 recorder->Sync();
+                kind = "sync open batch";
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
+                kind = "finish up to writer";
+            }
+            if (kind != nullptr && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+                // Why the writer wait was not deferred: the first flushed image that would store off the GPU-direct path.
+                const char* why = !deferRefresh ? "defer off" : reason == nullptr || std::strcmp(reason, "storage refresh") != 0 ? "not a storage refresh" : "deferrable";
+                if (deferRefresh && std::strcmp(why, "deferrable") == 0) {
+                    for (const auto& texture : flush) {
+                        if (!texture->blockUnits) { why = "an image without block units"; break; }
+                        if (HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr) { why = "an image without an import"; break; }
+                    }
+                }
+                NoteFlushWait(reason, kind, why, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
