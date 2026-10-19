@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
@@ -1209,6 +1210,33 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
+namespace {
+
+// The end of the bytes a single small level's elements occupy in its standard-swizzle block (the
+// mip chains the game builds level by level pack each level right behind the previous one's
+// elements, inside the block a level smaller than a block would claim whole). guestBytes for any
+// other surface. APS5_NO_PRECISE_SMALL_OVERLAP=1: always guestBytes.
+std::uint64_t SmallImageElementExtent(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry, std::uint32_t elementBytes) {
+    static const bool disabled = std::getenv("APS5_NO_PRECISE_SMALL_OVERLAP") != nullptr;
+    const auto whole = geometry.guestBytes;
+    if (disabled || geometry.thick || geometry.mips.size() != 1 || geometry.layers != 1 || geometry.imageDepth != 1 || BlockWidth(descriptor.format) != 1 || BlockHeight(descriptor.format) != 1) return whole;
+    if (descriptor.tileMode != TextureTileMode::kStandard4KB && descriptor.tileMode != TextureTileMode::kStandard64KB) return whole;
+    const auto& mip = geometry.mips.front();
+    if (mip.tail || mip.width == 0 || mip.height == 0 || mip.tiledOffset != 0 || whole > 65536u) return whole;
+    try {
+        const ColorTargetLayout layout(mip.width, mip.height, descriptor.tileMode == TextureTileMode::kStandard4KB ? ColorTileMode::Standard4KB : ColorTileMode::Standard64KB, elementBytes);
+        std::uint64_t end = 0;
+        for (std::uint32_t y = 0; y < mip.height; ++y) {
+            for (std::uint32_t x = 0; x < mip.width; ++x) end = std::max<std::uint64_t>(end, layout.Offset(x, y) + elementBytes);
+        }
+        return end != 0 && end <= whole ? end : whole;
+    } catch (const std::exception&) {
+        return whole;
+    }
+}
+
+}
+
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
@@ -1223,6 +1251,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
+        elementExtent = SmallImageElementExtent(descriptor, geometry, elementBytes);
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
@@ -1965,7 +1994,7 @@ bool StorageTexture::Refresh() {
         if (overlapKind.empty()) overlapKind = "no other pending image (own or flushing)";
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
-    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(elementExtent), alias.get(), "storage refresh", PublishScope::None);
     if (profile) NoteRefreshOutcome(flushed, alias != nullptr, aliasRejected, overlapKind);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -3365,6 +3394,10 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
     return address < descriptor.baseAddress + guestBytes && descriptor.baseAddress < address + bytes;
 }
 
+bool StorageTexture::overlapsElements(std::uint64_t address, std::size_t bytes) const {
+    return address < descriptor.baseAddress + elementExtent && descriptor.baseAddress < address + bytes;
+}
+
 bool StorageTexture::overlapsLive(std::uint64_t address, std::size_t bytes) const {
     return !released && guestBytes != 0 && overlaps(address, bytes);
 }
@@ -3530,9 +3563,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const auto* exempt = refreshing;
+        // A storage refresh asks for its elements' bytes only: an image whose elements end before
+        // them (a small level packed in front of it) keeps its results; its write-back keeps the
+        // bytes it does not own (the padding seeds) in GPU order.
+        const bool elementsOnly = reason != nullptr && std::strcmp(reason, "storage refresh") == 0;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && (elementsOnly ? texture->overlapsElements(address, bytes) : texture->overlaps(address, bytes))) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;

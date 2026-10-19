@@ -563,6 +563,9 @@ private:
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
+    // Like overlaps, against the bytes the image's elements occupy (elementExtent): a small tiled image
+    // that leaves the rest of its block to other images ends there. Storage refreshes use it.
+    bool overlapsElements(std::uint64_t address, std::size_t bytes) const;
     // Whether the image is live (not released) and overlaps the fill: the test that gives ClassifyFill
     // its overlapping images, and that NoteKeysFill and ClearByKeysFill use to bound the key match.
     bool overlapsLive(std::uint64_t address, std::size_t bytes) const;
@@ -583,6 +586,8 @@ private:
     std::vector<TileMipLayout> mips;
     std::uint32_t arrayLayers = 1;
     std::uint64_t guestBytes = 0;
+    // The end of the bytes the elements occupy (guestBytes unless a single small level computes less).
+    std::uint64_t elementExtent = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
