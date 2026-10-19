@@ -188,7 +188,11 @@ PadInputState PadInput::sampleController() const {
         }
     }
     if (viewPressed && !result.touch[0].active && !result.touch[1].active) {
-        result.touch[0] = {true, 960, 471, 0};
+        // While View is held the right stick places the finger on the touchpad (centered stick = center),
+        // so a controller without a touchpad can swipe; the stick itself reads centered to the title.
+        result.touch[0] = {true, static_cast<std::uint16_t>(right[0] * 1919u / 255u), static_cast<std::uint16_t>(right[1] * 942u / 255u), 0};
+        result.sticks[2] = 128;
+        result.sticks[3] = 128;
     }
     return result;
 }
