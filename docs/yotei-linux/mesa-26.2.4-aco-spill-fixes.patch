@@ -1,0 +1,224 @@
+From d3cd2b2b2bef74821ed2fda78edf8e3dd1c21188 Mon Sep 17 00:00:00 2001
+From: hritikutekar <hritikdrocks@gmail.com>
+Date: Tue, 20 Oct 2026 08:59:47 +0530
+Subject: [PATCH] aco: spill interference lists as vectors (memory) + LDS
+ spill/reload memory_sync_info (scheduler reorder fix); ACO_SPILL_STATS diag;
+ radv local change
+
+---
+ src/amd/compiler/aco_spill.cpp | 65 ++++++++++++++++++++++++++++------
+ src/amd/compiler/aco_util.h    | 10 +++++-
+ src/amd/vulkan/radv_shader.c   | 21 +++++++++++
+ 3 files changed, 85 insertions(+), 11 deletions(-)
+
+diff --git a/src/amd/compiler/aco_spill.cpp b/src/amd/compiler/aco_spill.cpp
+index 3e238f1d97b..a6dfd63dd62 100644
+--- a/src/amd/compiler/aco_spill.cpp
++++ b/src/amd/compiler/aco_spill.cpp
+@@ -75,7 +75,12 @@ struct spill_ctx {
+    std::vector<loop_info> loop;
+ 
+    std::vector<use_info> ssa_infos;
+-   std::vector<std::pair<RegClass, std::unordered_set<uint32_t>>> interferences;
++   /* Interfering spill ids per spill id. A plain vector instead of a hash set: huge shaders keep
++    * thousands of values spilled at once, and every new spill interferes with all of them, so the
++    * graph has hundreds of millions of edges. Duplicates are removed lazily (compact_interferences),
++    * keeping each list within about twice its unique size. */
++   std::vector<std::pair<RegClass, std::vector<uint32_t>>> interferences;
++   std::vector<uint32_t> interferences_compacted;
+    std::vector<std::vector<uint32_t>> affinities;
+    std::vector<bool> is_reloaded;
+    aco::unordered_map<Temp, remat_info> remat;
+@@ -154,14 +159,30 @@ struct spill_ctx {
+       if (interferences[first].first.type() != interferences[second].first.type())
+          return;
+ 
+-      bool inserted = interferences[first].second.insert(second).second;
+-      if (inserted)
+-         interferences[second].second.insert(first);
++      push_interference(first, second);
++      push_interference(second, first);
++   }
++
++   void push_interference(uint32_t id, uint32_t other)
++   {
++      std::vector<uint32_t>& ids = interferences[id].second;
++      ids.push_back(other);
++      if (ids.size() >= 2 * interferences_compacted[id] + 64)
++         compact_interferences(id);
++   }
++
++   void compact_interferences(uint32_t id)
++   {
++      std::vector<uint32_t>& ids = interferences[id].second;
++      std::sort(ids.begin(), ids.end());
++      ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++      interferences_compacted[id] = ids.size();
+    }
+ 
+    uint32_t allocate_spill_id(RegClass rc)
+    {
+-      interferences.emplace_back(rc, std::unordered_set<uint32_t>());
++      interferences.emplace_back(rc, std::vector<uint32_t>());
++      interferences_compacted.push_back(0);
+       is_reloaded.push_back(false);
+       return next_spill_id++;
+    }
+@@ -1352,6 +1373,9 @@ setup_vgpr_spill_reload_lds(spill_ctx& ctx, Block& block,
+    return offset;
+ }
+ 
++/* LDS spills and reloads carry the same memory_sync_info as scratch ones: without it the scheduler
++ * (which runs after spilling) sees no storage class on these DS instructions and may move a reload
++ * above the store of the value it reads from the same slot. */
+ void
+ spill_vgpr(spill_ctx& ctx, Block& block, std::vector<aco_ptr<Instruction>>& instructions,
+            aco_ptr<Instruction>& spill, std::vector<uint32_t>& slots)
+@@ -1394,7 +1418,8 @@ spill_vgpr(spill_ctx& ctx, Block& block, std::vector<aco_ptr<Instruction>>& inst
+       for (unsigned i = 0; i < temp.size(); i++) {
+          Temp elem = split->definitions[i].getTemp();
+          if (i < lds_slots) {
+-            bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(ctx.lds_m0_zero), elem, lds_offset);
++            bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(ctx.lds_m0_zero), elem, lds_offset)
++               .instr->ds().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
+             lds_offset += workgroup_size * 4;
+          } else if (ctx.program->gfx_level >= GFX9) {
+             bld.scratch(aco_opcode::scratch_store_dword, Operand(v1), ctx.scratch_rsrc, elem,
+@@ -1409,7 +1434,8 @@ spill_vgpr(spill_ctx& ctx, Block& block, std::vector<aco_ptr<Instruction>>& inst
+          }
+       }
+    } else if (lds_slots) {
+-      bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(ctx.lds_m0_zero), temp, lds_offset);
++      bld.ds(aco_opcode::ds_write_addtid_b32, bld.m0(ctx.lds_m0_zero), temp, lds_offset)
++         .instr->ds().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
+    } else if (ctx.program->gfx_level >= GFX9) {
+       bld.scratch(aco_opcode::scratch_store_dword, Operand(v1), ctx.scratch_rsrc, temp, offset,
+                   memory_sync_info(storage_vgpr_spill, semantic_private));
+@@ -1458,7 +1484,8 @@ reload_vgpr(spill_ctx& ctx, Block& block, std::vector<aco_ptr<Instruction>>& ins
+          vec->operands[i] = Operand(tmp);
+          if (i < lds_slots) {
+             bld.ds(aco_opcode::ds_read_addtid_b32, Definition(tmp), bld.m0(ctx.lds_m0_zero),
+-                   lds_offset);
++                   lds_offset)
++               .instr->ds().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
+             lds_offset += workgroup_size * 4;
+          } else if (ctx.program->gfx_level >= GFX9) {
+             bld.scratch(aco_opcode::scratch_load_dword, Definition(tmp), Operand(v1),
+@@ -1476,7 +1503,8 @@ reload_vgpr(spill_ctx& ctx, Block& block, std::vector<aco_ptr<Instruction>>& ins
+       }
+       bld.insert(vec);
+    } else if (lds_slots) {
+-      bld.ds(aco_opcode::ds_read_addtid_b32, def, bld.m0(ctx.lds_m0_zero), lds_offset);
++      bld.ds(aco_opcode::ds_read_addtid_b32, def, bld.m0(ctx.lds_m0_zero), lds_offset)
++         .instr->ds().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
+    } else if (ctx.program->gfx_level >= GFX9) {
+       bld.scratch(aco_opcode::scratch_load_dword, def, Operand(v1), ctx.scratch_rsrc, offset,
+                   memory_sync_info(storage_vgpr_spill, semantic_private));
+@@ -1632,6 +1660,8 @@ assign_spill_slots(spill_ctx& ctx, unsigned spills_to_vgpr)
+          }
+       }
+    }
++   for (uint32_t i = 0; i < ctx.interferences.size(); i++)
++      ctx.compact_interferences(i);
+    for (ASSERTED uint32_t i = 0; i < ctx.interferences.size(); i++)
+       for (ASSERTED uint32_t id : ctx.interferences[i].second)
+          assert(i != id);
+@@ -1942,8 +1972,23 @@ spill(Program* program)
+    get_rematerialize_info(ctx);
+ 
+    /* create spills and reloads */
+-   for (unsigned i = 0; i < program->blocks.size(); i++)
++   /* TEMPORARY yotei diagnostic: ACO_SPILL_STATS=1 prints the spiller's per-block storage. */
++   static const bool spill_stats = getenv("ACO_SPILL_STATS") != NULL;
++   for (unsigned i = 0; i < program->blocks.size(); i++) {
+       spill_block(ctx, i);
++      if (spill_stats && ((i & 4095) == 4095 || i + 1 == program->blocks.size())) {
++         size_t edges = 0, entry = 0, exit = 0, renames = 0;
++         for (auto& item : ctx.interferences)
++            edges += item.second.size();
++         for (unsigned b = 0; b <= i; b++) {
++            entry += ctx.spills_entry[b].size();
++            exit += ctx.spills_exit[b].size();
++            renames += ctx.renames[b].size();
++         }
++         fprintf(stderr, "[aco-spill] block %u/%zu spill ids %u edges %zu entry %zu exit %zu renames %zu\n",
++                 i + 1, program->blocks.size(), ctx.next_spill_id, edges, entry, exit, renames);
++      }
++   }
+ 
+    /* assign spill slots and DCE rematerialized code */
+    assign_spill_slots(ctx, extra_vgprs);
+diff --git a/src/amd/compiler/aco_util.h b/src/amd/compiler/aco_util.h
+index 9f20e80a554..b947e9eee04 100644
+--- a/src/amd/compiler/aco_util.h
++++ b/src/amd/compiler/aco_util.h
+@@ -274,13 +274,20 @@ public:
+          return ptr;
+       }
+ 
+-      /* create new larger buffer */
++      /* create new larger buffer: doubling, but at most max_growth_size per buffer unless the
++       * allocation itself needs more. Unbounded doubling asks giant shaders' spillers for one
++       * contiguous buffer of many GB, which malloc refuses long before memory runs out. */
+       size_t total_size = buffer->data_size + sizeof(Buffer);
+       do {
+          total_size *= 2;
+       } while (total_size - sizeof(Buffer) < size);
++      total_size = MIN2(total_size, MAX2(max_growth_size, size + sizeof(Buffer)));
+       Buffer* next = buffer;
+       buffer = (Buffer*)malloc(total_size);
++      if (!buffer) {
++         fprintf(stderr, "ACO: out of memory allocating %zu bytes\n", total_size);
++         abort();
++      }
+       buffer->next = next;
+       buffer->data_size = total_size - sizeof(Buffer);
+       buffer->current_idx = 0;
+@@ -343,6 +350,7 @@ private:
+    Buffer* buffer;
+    static constexpr size_t initial_size = 4096;
+    static constexpr size_t minimum_size = 128;
++   static constexpr size_t max_growth_size = 256u << 20;
+    static_assert(minimum_size > sizeof(Buffer));
+ };
+ 
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index a60972a110a..d26b89b4e1b 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -3101,11 +3101,32 @@ radv_shader_create_uncached(struct radv_device *device, const struct radv_shader
+    shader->bo = shader->alloc->arena->bo;
+    shader->va = radv_buffer_get_va(shader->bo) + shader->alloc->offset;
+ 
++   /* Yotei debug aid: RADV_PRINT_SHADER_VA=1 prints each uploaded shader's GPU code range so a
++    * faulting wave PC (umr) can be mapped to its pipeline. */
++   static int print_va = -1;
++   if (print_va < 0)
++      print_va = getenv("RADV_PRINT_SHADER_VA") != NULL;
++   if (print_va)
++      fprintf(stderr, "[radv-shader-va] stage=%d va=0x%" PRIx64 "-0x%" PRIx64 " code=%u\n", shader->info.stage,
++              shader->va, shader->va + shader->code_size, shader->code_size);
++
+    if (!radv_shader_upload(device, shader, binary)) {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       goto out;
+    }
+ 
++   /* RADV_DUMP_SHADER_BIN=<dir> writes each uploaded shader's machine code to <dir>/<code_size>.bin. */
++   const char *dump_dir = getenv("RADV_DUMP_SHADER_BIN");
++   if (dump_dir && shader->code) {
++      char path[512];
++      snprintf(path, sizeof(path), "%s/%u.bin", dump_dir, shader->code_size);
++      FILE *f = fopen(path, "wb");
++      if (f) {
++         fwrite(shader->code, 1, shader->code_size, f);
++         fclose(f);
++      }
++   }
++
+    /* Precompute register values for faster emission. */
+    radv_precompute_registers(device, shader);
+ 
+-- 
+2.56.0
+
