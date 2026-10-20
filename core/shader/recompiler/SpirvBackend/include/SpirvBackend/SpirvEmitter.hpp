@@ -31,6 +31,9 @@ struct SpirvTargetOptions {
     std::uint64_t programAddress = 0;
     // Faulting reads continue with zero in wave-operation programs (the older fix) instead of stopping the invocation.
     bool bdaContinueWaveOperations = false;
+    bool fusedFma = false;
+    // ShaderComputeStageInfo::singleWorkgroup of the request.
+    bool singleWorkgroup = false;
 };
 
 struct SpirvEmitInfo {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
@@ -2890,7 +2891,11 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
 }
 
-GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}
+namespace {
+bool bdaStagingEnabled();
+}
+
+GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context), bdaStaging(bdaStagingEnabled()) {}
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
     return std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
@@ -3254,8 +3259,7 @@ namespace {
 // Device-local staging for address-based compute builds (BDA overlays, see resolveOverlays).
 // APS5_NO_BDA_STAGING=1: their written descriptor ranges stay in the space's imports, as before.
 bool bdaStagingEnabled() {
-    static const bool disabled = std::getenv("APS5_NO_BDA_STAGING") != nullptr;
-    return !disabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging);
 }
 
 template<typename Regions>
@@ -3286,7 +3290,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
                 overlay = true;
                 break;
             }
-            if (bdaStagingEnabled() && stagingAllowed) servedInsideBase.emplace_back(begin, end);
+            if (bdaStaging && stagingAllowed) servedInsideBase.emplace_back(begin, end);
             return;
         case BaseOverlap::Partial:
             if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
@@ -3715,7 +3719,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
-    return !readOnly && bdaStagingEnabled() && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
+    return !readOnly && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
 }
 
 // Device-local staging for address-based builds (BDA overlays). Such a build binds its written V#
@@ -4315,17 +4319,30 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
     // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
     // before the run for transfers too, and the run's dispatches the title leaves unordered with this
-    // one (their copy-backs wait for the run's end, Recorder::AfterRun).
+    // one (their copy-backs wait for the run's end, Recorder::AfterRun). Outside a run the leading
+    // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
     bool inRun = false;
-    const auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun) : recorder->Commands();
-    const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    VkAccessFlags covered = 0;
+    auto commands = Recorder::DispatchOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered) : recorder->Commands(&covered);
+    // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
+    // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
+    // Not with the capture's read-backs or the hazard validator (both work per copy).
+    bool prelude = false;
+    if (inRun && Recorder::BatchedStagingEnabled() && !capture && !Recorder::BarrierValidate()) {
+        if (const auto preludeCommands = recorder->PreludeCommands(); preludeCommands != VK_NULL_HANDLE) {
+            commands = preludeCommands;
+            prelude = true;
+        }
+    }
+    const auto timing = prelude ? Recorder::NoTiming : recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    if (!inRun) {
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    if (!inRun && !Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
+        RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     }
     bool stagedAny = false;
@@ -4426,7 +4443,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             region->diffUse = true;
             diffed.push_back(region);
         }
-        if (!diffed.empty()) {
+        if (!diffed.empty() && prelude) {
+            // Recorded at the prelude's end, behind one transfer barrier for the whole run.
+            for (auto* region : diffed) {
+                recorder->PreludePristine(region->buffer->Handle(), region->pristine->Handle(), region->end - region->begin);
+                recorder->Keep(region->pristine);
+            }
+        } else if (!diffed.empty()) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
             for (auto* region : diffed) {
@@ -4438,10 +4461,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     if (stagedAny) reportStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
-    // tessellation shaders too (the batch's own barriers around dispatches are as wide).
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-    recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
+    // prelude's copies get the prelude's barrier at its end (Recorder::sealPrelude).
+    if (!prelude) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
@@ -4456,6 +4482,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
+    // A run's copy-backs share one trailing barrier, recorded by the run after all of them; they
+    // need no leading one (the run's deferred barrier just ordered its dispatches' writes) unless
+    // an earlier one of them wrote an overlapping range (Recorder::AfterRunWrite).
+    const bool merging = recorder.AfterRunMerging();
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
         if (merged.empty() && !writes.empty()) {
@@ -4470,13 +4500,29 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
+            if (merging) {
+                if (!recording) {
+                    commands = recorder.Commands();
+                    recording = true;
+                }
+                if (recorder.AfterRunWrite(from, to)) {
+                    // Writes after writes to the same guest bytes stay in recording order.
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+            }
             if (!recording) {
-                commands = recorder.Commands();
+                VkAccessFlags covered = 0;
+                commands = recorder.Commands(&covered);
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
                 // The shader's stores into the buffer (whichever stage made them) precede the copy
-                // (and the APS5_STAGING_DIFF kernel's reads).
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u));
-                Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                // (and the APS5_STAGING_DIFF kernel's reads), unless the trailing barrier just
+                // recorded already orders them (ElideCovered).
+                const BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u)};
+                if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
+                    RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
@@ -4521,7 +4567,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
     }
-    if (!recording) return;
+    if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
