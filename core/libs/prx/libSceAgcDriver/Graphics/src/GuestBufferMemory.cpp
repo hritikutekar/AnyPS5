@@ -6109,24 +6109,71 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DirectWr
     return result;
 }
 
+namespace {
+
+// APS5_PROFILE_DRAW (PERF-PLAN D2b): why an address-based reuse's snapshot proof failed, every 10 s as a
+// [snapshot-refusal] line: the list's length or a snapshot's address/size moved (a rebind would be needed),
+// or the bytes differ at the same address (a refresh of the build's copy could serve them).
+enum class SnapshotRefusal : std::size_t { Count, Address, Size, LiveBytes, CopiedBytes, Region, Count_ };
+struct SnapshotRefusals {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SnapshotRefusal::Count_)> reasons{};
+    std::atomic<std::uint64_t> passed{0};
+    std::atomic<std::uint64_t> differingBytes{0};
+    std::atomic<std::uint64_t> snapshotsCompared{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SnapshotRefusals& snapshotRefusals() {
+    static SnapshotRefusals counts;
+    return counts;
+}
+
+bool snapshotRefused(SnapshotRefusal reason, std::size_t differing = 0) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return false;
+    auto& counts = snapshotRefusals();
+    counts.reasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    counts.differingBytes.fetch_add(differing, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (now - last >= 10 && counts.lastReport.compare_exchange_strong(last, now)) {
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        const auto refused = [&](SnapshotRefusal kind) { return take(counts.reasons[static_cast<std::size_t>(kind)]); };
+        std::fprintf(stderr, "[snapshot-refusal] (10 s): list length %llu, address %llu, size %llu, live bytes %llu, copied bytes %llu, region %llu; passed %llu; %llu bytes differing at the first mismatch (summed), %llu snapshots compared\n", refused(SnapshotRefusal::Count), refused(SnapshotRefusal::Address), refused(SnapshotRefusal::Size), refused(SnapshotRefusal::LiveBytes), refused(SnapshotRefusal::CopiedBytes), refused(SnapshotRefusal::Region), take(counts.passed), take(counts.differingBytes), take(counts.snapshotsCompared));
+    }
+    return false;
+}
+
+std::size_t differingByteCount(const std::byte* left, const std::byte* right, std::size_t bytes) {
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < bytes; ++index) count += left[index] != right[index];
+    return count;
+}
+
+}
+
 bool GuestBufferMemory::SameSnapshots(std::span<const GuestMemorySnapshot> snapshots) const {
-    if (snapshots.size() != snapshotUses.size()) return false;
+    if (snapshots.size() != snapshotUses.size()) return snapshotRefused(SnapshotRefusal::Count);
+    snapshotRefusals().snapshotsCompared.fetch_add(snapshots.size(), std::memory_order_relaxed);
     for (std::size_t index = 0; index < snapshots.size(); ++index) {
         const auto& snapshot = snapshots[index];
         const auto& use = snapshotUses[index];
-        if (snapshot.address != use.address || snapshot.bytes.size() != use.bytes) return false;
+        if (snapshot.address != use.address) return snapshotRefused(SnapshotRefusal::Address);
+        if (snapshot.bytes.size() != use.bytes) return snapshotRefused(SnapshotRefusal::Size);
         if (use.live) {
-            if (liveSnapshotCompared(snapshot.address, snapshot.bytes.size()) && std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+            if (liveSnapshotCompared(snapshot.address, snapshot.bytes.size()) && std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return snapshotRefused(SnapshotRefusal::LiveBytes, differingByteCount(reinterpret_cast<const std::byte*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()));
             continue;
         }
         const auto found = std::upper_bound(regions.begin(), regions.end(), snapshot.address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
-        if (found == regions.begin()) return false;
+        if (found == regions.begin()) return snapshotRefused(SnapshotRefusal::Region);
         const auto& region = *std::prev(found);
-        if (region.buffer == nullptr || region.direct != nullptr || region.mirror != nullptr || snapshot.address + snapshot.bytes.size() > region.end) return false;
+        if (region.buffer == nullptr || region.direct != nullptr || region.mirror != nullptr || snapshot.address + snapshot.bytes.size() > region.end) return snapshotRefused(SnapshotRefusal::Region);
         const auto bytes = region.buffer->Bytes();
         const auto offset = static_cast<std::size_t>(snapshot.address - region.begin);
-        if (offset + snapshot.bytes.size() > bytes.size() || std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+        if (offset + snapshot.bytes.size() > bytes.size()) return snapshotRefused(SnapshotRefusal::Region);
+        if (std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return snapshotRefused(SnapshotRefusal::CopiedBytes, differingByteCount(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()));
     }
+    snapshotRefusals().passed.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

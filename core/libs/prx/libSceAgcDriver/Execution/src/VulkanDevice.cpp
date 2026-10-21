@@ -137,6 +137,25 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     PerformanceCounters::CountPipeline();
 }
 
+// APS5_DUMP_COMPUTE_ADDRESSES=<hex>[,...] (PERF-PLAN G3): capture only these programs (with
+// APS5_DUMP_COMPUTE_PIPELINES); unset captures every program as before.
+bool CaptureComputeProgram(std::uint64_t programAddress) {
+    static const std::vector<std::uint64_t> addresses = [] {
+        std::vector<std::uint64_t> result;
+        if (const char* text = std::getenv("APS5_DUMP_COMPUTE_ADDRESSES")) {
+            for (const char* at = text; *at != '\0';) {
+                char* end = nullptr;
+                const auto address = std::strtoull(at, &end, 16);
+                if (end == at) break;
+                result.push_back(address);
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return result;
+    }();
+    return addresses.empty() || std::find(addresses.begin(), addresses.end(), programAddress) != addresses.end();
+}
+
 bool CaptureComputePipeline(std::size_t words) {
     const char* minimum = std::getenv("APS5_DUMP_COMPUTE_MIN_WORDS");
     if (minimum == nullptr) return true;
@@ -5574,7 +5593,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     const Graphics::PipelineSpecialization specialization(shader);
     const auto subgroupSize = computeSubgroupSize(shader);
     const auto stageFlags = computeStageFlags(shader);
-    if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled() && CaptureComputePipeline(shader.spirv.size())) {
+    if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && ComputePipelineCapture::OptionalEnabled() && CaptureComputePipeline(shader.spirv.size()) && CaptureComputeProgram(programAddress)) {
         ComputePipelineCapture capture;
         capture.spirv = shader.spirv.Copy();
         ComputeDescriptorSetLayout resourcesLayout;
@@ -5598,7 +5617,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         capture.apiVersion = state->properties.apiVersion;
         std::copy_n(state->properties.pipelineCacheUUID, VK_UUID_SIZE, capture.pipelineCacheUuid.begin());
         const auto path = capture.WriteOptional(directory);
-        if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
+        if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s (program 0x%llx, %zu SPIR-V words)\n", path.string().c_str(), static_cast<unsigned long long>(programAddress), shader.spirv.size());
     }
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, shader.spirv.size(), context.pipelineCacheSynchronization);
