@@ -1912,7 +1912,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
 #endif
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies, requested by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), ImportRequesterName(requester));
-        if (std::string_view(step) == "vkAllocateMemory") {
+        // Only an out-of-memory result lowers the budget: RADV refuses some host ranges with
+        // VK_ERROR_INVALID_EXTERNAL_HANDLE (~110 per Yotei run, each falls back to copies), and counting
+        // those collapsed the budget to the live bytes, refusing tens of thousands of imports.
+        // APS5_NO_IMPORT_OOM_FILTER=1 counts every vkAllocateMemory failure as before.
+        static const bool anyFailure = std::getenv("APS5_NO_IMPORT_OOM_FILTER") != nullptr;
+        if (std::string_view(step) == "vkAllocateMemory" && (anyFailure || result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)) {
             state.allocationFailed = true;
             if (++state.allocationFailures >= 3 || state.liveBytes + bytes + budget / 8 >= budget) {
                 state.ceiling = std::max<std::uint64_t>(state.liveBytes, 1);
@@ -5558,7 +5563,7 @@ void GuestBufferMemory::checkAddressRanges(std::span<const ShaderRecompiler::Bda
         if (region.direct != nullptr) {
             auto& state = Imports();
             const bool held = state.mutex.HeldByThisThread();
-            std::unique_lock<ImportsMutex> lock(state.mutex, std::defer_lock);
+            std::unique_lock<HostImportMutex> lock(state.mutex, std::defer_lock);
             if (!held) lock.lock();
             for (const auto& [base, entry] : state.imports) {
                 if (&entry == region.direct) {
