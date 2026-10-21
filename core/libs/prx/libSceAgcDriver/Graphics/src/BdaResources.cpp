@@ -43,6 +43,8 @@ struct TableEntry {
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
+    // The buffer's size (header, ranges, range index): a hit serves it without rebuilding the index.
+    std::size_t tableBytes = 0;
 };
 
 struct TableCache {
@@ -152,10 +154,16 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
+    // It is built only on a table-cache miss: a hit reuses the cached buffer and its size, so
+    // building it first throws the work away. APS5_NO_BDA_LAZY_INDEX=1 builds it eagerly, as before.
     static const bool indexDisabled = std::getenv("APS5_NO_BDA_INDEX") != nullptr;
-    const auto index = indexDisabled ? std::vector<std::uint32_t>{} : ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t);
-    Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+    static const bool lazyIndexDisabled = std::getenv("APS5_NO_BDA_LAZY_INDEX") != nullptr;
+    std::vector<std::uint32_t> index;
+    if (lazyIndexDisabled) {
+        if (!indexDisabled) index = ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
+        tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t);
+        Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+    }
     auto& cache = Tables();
     std::uint64_t hash = 0;
     if (tableCacheEnabled()) {
@@ -172,6 +180,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     ++cache.hits;
                     ++cache.classes.spaceTables;
                     table = std::move(shared);
+                    if (!lazyIndexDisabled) tableBytes = it->tableBytes;
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -205,11 +214,17 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
                 table = std::move(shared);
+                if (!lazyIndexDisabled) tableBytes = it->tableBytes;
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
             ++it;
         }
+    }
+    if (!lazyIndexDisabled) {
+        if (!indexDisabled) index = ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
+        tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t);
+        Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     }
     Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges do not ascend by begin");
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
@@ -226,7 +241,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, tableBytes});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }

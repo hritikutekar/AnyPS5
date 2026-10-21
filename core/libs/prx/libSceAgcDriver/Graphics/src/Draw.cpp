@@ -40,6 +40,7 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <unistd.h>
 
 namespace AgcDriver::Graphics {
 
@@ -2341,10 +2342,15 @@ std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutpu
 }
 
 // Debug aid: APS5_DUMP_TARGETS=<n> saves the first n renders of every color target as a raw file
-// (u32 width, u32 height, u32 VkFormat, then tightly packed rows).
+// (u32 width, u32 height, u32 VkFormat, then tightly packed rows). With
+// APS5_DUMP_TARGETS_ARMED=<path>, renders are dumped only while that file exists, so a run can
+// reach a scene at full speed and then dump it (touch the file, wait, remove it).
 int DumpTargetLimit() {
     static const int dumpLimit = [] { const char* text = std::getenv("APS5_DUMP_TARGETS"); return text ? std::atoi(text) : 0; }();
-    return dumpLimit;
+    if (dumpLimit <= 0) return 0;
+    static const char* armedPath = std::getenv("APS5_DUMP_TARGETS_ARMED");
+    if (armedPath == nullptr) return dumpLimit;
+    return ::access(armedPath, F_OK) == 0 ? dumpLimit : 0;
 }
 
 // A draw whose targets are all resident is recorded into the device's open batch like a dispatch:
@@ -2943,6 +2949,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             imageBarrier(context, commands, binding.resident->Image(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, {VK_IMAGE_ASPECT_COLOR_BIT, binding.color.mip, 1, binding.resident->ImageDepth() == 1 ? binding.color.arraySlice : 0, binding.resident->ImageDepth() == 1 ? binding.color.layers : 1});
             countBarrier();
+            // APS5_DUMP_TARGETS: resident targets stay on the GPU, so copy the rendered
+            // slice out here (2D single-layer mip 0 only; the common target shape).
+            if (dumpLimit > 0 && binding.color.mip == 0 && binding.color.layers == 1 && binding.color.depth == 1 && binding.resident->ImageDepth() == 1) {
+                std::lock_guard lock(dumpMutex);
+                if (dumped[binding.color.address] < dumpLimit) {
+                    binding.dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(binding.color.extent.width) * binding.color.extent.height * binding.color.elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    VkBufferImageCopy dumpCopy{};
+                    dumpCopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, binding.color.arraySlice, 1};
+                    dumpCopy.imageExtent = {binding.color.extent.width, binding.color.extent.height, 1};
+                    context.Resolved(&DeviceFunctions::cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer")(commands, binding.resident->Image(), VK_IMAGE_LAYOUT_GENERAL, binding.dump->Handle(), 1, &dumpCopy);
+                }
+            }
             continue;
         }
         VkBufferImageCopy copy{};
@@ -2972,6 +2990,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.linearDevice->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.mip, true, 0, false, {.pipeBankXor = binding.color.pipeBankXor});
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             CopyBuffer(context, commands, binding.tiledDevice->Handle(), 0, binding.tiled->Handle(), 0, binding.original.size());
+        } else if (dumpLimit > 0) {
+            // Linear targets hold their pixels in the transfer buffer already.
+            std::lock_guard lock(dumpMutex);
+            if (dumped[binding.color.address] < dumpLimit) {
+                binding.dump = std::make_unique<Buffer>(context, binding.transfer->Bytes().size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                CopyBuffer(context, commands, binding.transfer->Handle(), 0, binding.dump->Handle(), 0, binding.transfer->Bytes().size());
+            }
         }
     }
     VkMemoryBarrier download{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -3025,6 +3050,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             std::fwrite(header, sizeof(header), 1, file);
             std::fwrite(binding.dump->Bytes().data(), 1, binding.dump->Bytes().size(), file);
             std::fclose(file);
+            std::fprintf(stderr, "[dump-target] %s %ux%u vkFormat=%u bytes=%zu\n", name, binding.color.extent.width, binding.color.extent.height, static_cast<unsigned>(binding.color.format), binding.dump->Bytes().size());
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Shader resources WriteBack");

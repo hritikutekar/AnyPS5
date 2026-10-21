@@ -67,7 +67,7 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
    VK_ICD_FILENAMES=<mesa>/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json
    APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1 APS5_STAGING_DIFF=1
    APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
-   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200 APS5_SKIP_SHADER=80001df900
+   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200
    ```
 - Choose **Performance** in the graphics settings; memory is tight with 32 GB, so have swap.
 - For menu benchmarks, force the GPU clock: `echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level`.
@@ -77,7 +77,8 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 - About 0.7 fps in the open world: per frame about 0.5 s of GPU work plus about 1 s of GPU idle waiting on the CPU side.
   Profiling is next; the goal is 30 fps.
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
-- Shader `0x80001df900` is skipped.
+- Shader `0x80001df900` (clustered-lighting compute pass, 747,518 SPIR-V words) used to hang or fault and was skipped;
+  with the ACO LDS spill fix it compiles (about 39 s cold) and runs in the world without faults, so it is no longer skipped.
 
 ## Credits
 

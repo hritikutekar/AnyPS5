@@ -91,6 +91,7 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         std::uint64_t snapshot = 0;
         VkBuffer table = VK_NULL_HANDLE;
         VkBuffer view = VK_NULL_HANDLE;
+        std::size_t tableRange = 0;
     };
     const auto build = [&](std::span<const std::byte> bytes, bool written, bool addressable, std::uint64_t address) {
         Build result;
@@ -114,6 +115,7 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         }
         result.bda = std::make_unique<BdaResources>(importing, memory);
         result.table = result.bda->Table().buffer;
+        result.tableRange = result.bda->Table().range;
         return result;
     };
     const bool spaces = AddressSpaceCounters().enabled;
@@ -129,6 +131,14 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         if (spaces) {
             Require(a.memory->CachedAddressTable().has_value() && c.memory->CachedAddressTable().has_value() && d.memory->CachedAddressTable().has_value(), "a build with its own regions over the address space has no cached BDA table");
             Require(a.table == b.table, "two builds of the same space and snapshot do not share their BDA table");
+            Require(a.tableRange == b.tableRange, "two builds sharing a BDA table serve different descriptor ranges");
+            // The range index is built only on a table-cache miss; a hit serves the cached size,
+            // which must still be the header, ranges and index the shader reads.
+            const auto expectedRange = [&](const Build& item) {
+                const auto itemRanges = item.memory->AddressRanges();
+                return sizeof(ShaderRecompiler::BdaAbi::Header) + itemRanges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + ShaderRecompiler::BdaAbi::BuildRangeIndex(itemRanges.data(), itemRanges.size()).size() * sizeof(std::uint32_t);
+            };
+            Require(a.tableRange == expectedRange(a) && b.tableRange == expectedRange(b), "a BDA table descriptor range is not its header, ranges and range index");
             Require(c.table != a.table, "a build with other snapshot bytes took another build's BDA table");
             Require(a.memory->CachedAddressTable()->serial == b.memory->CachedAddressTable()->serial && c.memory->CachedAddressTable()->serial != a.memory->CachedAddressTable()->serial, "cached BDA table serials do not follow the build's ranges");
         }

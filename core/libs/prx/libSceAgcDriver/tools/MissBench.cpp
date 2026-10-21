@@ -21,6 +21,9 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -45,10 +48,12 @@ std::uint64_t Fingerprint(const ShaderRecompiler::RecompileResult& result) {
 }
 
 struct Mapping {
-    std::vector<void*> blocks;
+    std::vector<std::pair<void*, std::size_t>> blocks;
     ~Mapping() {
 #ifdef _WIN32
-        for (auto* block : blocks) VirtualFree(block, 0, MEM_RELEASE);
+        for (const auto& [block, _] : blocks) VirtualFree(block, 0, MEM_RELEASE);
+#else
+        for (const auto& [block, bytes] : blocks) munmap(block, bytes);
 #endif
     }
 };
@@ -78,7 +83,7 @@ bool MapRegions(const std::vector<ShaderRecompiler::MemoryRegion>& regions, Mapp
                 VirtualFree(reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RELEASE | PreservePlaceholder);
                 block = virtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(begin), static_cast<SIZE_T>(end - begin), MEM_RESERVE | MEM_COMMIT | ReplacePlaceholder | MEM_WRITE_WATCH, PAGE_READWRITE, nullptr, 0);
                 if (block == reinterpret_cast<void*>(begin)) {
-                    mapping.blocks.push_back(block);
+                    mapping.blocks.emplace_back(block, static_cast<std::size_t>(end - begin));
                     continue;
                 }
             }
@@ -101,16 +106,43 @@ bool MapRegions(const std::vector<ShaderRecompiler::MemoryRegion>& regions, Mapp
             if (block != nullptr) VirtualFree(block, 0, MEM_RELEASE);
             return false;
         }
-        mapping.blocks.push_back(block);
+        mapping.blocks.emplace_back(block, static_cast<std::size_t>(end - begin));
     }
     for (const auto& region : regions) {
         if (!region.bytes.empty()) std::memcpy(reinterpret_cast<void*>(region.guestAddress), region.bytes.data(), region.bytes.size());
     }
     return true;
 #else
-    static_cast<void>(regions);
-    static_cast<void>(mapping);
-    return false;
+    constexpr std::uint64_t Page = 0x1000;
+    std::set<std::uint64_t> pages;
+    for (const auto& region : regions) {
+        if (region.bytes.empty()) continue;
+        for (auto page = region.guestAddress & ~(Page - 1u); page < region.guestAddress + region.bytes.size(); page += Page) pages.insert(page);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    for (const auto page : pages) {
+        if (!runs.empty() && runs.back().second == page) runs.back().second += Page;
+        else runs.emplace_back(page, page + Page);
+    }
+    for (const auto& [begin, end] : runs) {
+        // MAP_FIXED_NOREPLACE: a guest address that collides with the bench's own mappings fails
+        // instead of silently replacing them.
+        void* mapped = mmap(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapped != MAP_FAILED && mapped != reinterpret_cast<void*>(begin)) {
+            munmap(mapped, static_cast<std::size_t>(end - begin));
+            mapped = MAP_FAILED;
+            errno = EEXIST;
+        }
+        if (mapped == MAP_FAILED) {
+            std::printf("  cannot map 0x%llx+0x%llx (errno %d)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), errno);
+            return false;
+        }
+        mapping.blocks.emplace_back(mapped, static_cast<std::size_t>(end - begin));
+    }
+    for (const auto& region : regions) {
+        if (!region.bytes.empty()) std::memcpy(reinterpret_cast<void*>(region.guestAddress), region.bytes.data(), region.bytes.size());
+    }
+    return true;
 #endif
 }
 
