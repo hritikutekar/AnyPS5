@@ -11,7 +11,7 @@
 namespace AgcDriver::Graphics {
 
 // Driver switches that may change while the game runs (the in-run A/B, APS5_AB). Each is an APS5_*
-// (mostly APS5_NO_*; APS5_QUIET_PUBLISH and APS5_LANE_SERIALIZE are opt-in)
+// (mostly APS5_NO_*; APS5_QUIET_PUBLISH, APS5_LANE_SERIALIZE and APS5_SAMPLED_LATER_USE_REFUSAL are opt-in)
 // variable whose presence selects one of two exact paths; it starts as set when the variable is set.
 // Every reader takes it once per operation (a build, a submission, a draw), so an operation never
 // sees both settings.
@@ -38,6 +38,7 @@ enum class RuntimeSwitch : std::size_t {
     LaneSerialize,
     NoLaneOverlap,
     NoPresentFrameAge,
+    SampledLaterUseRefusal,
     Count,
 };
 
