@@ -270,16 +270,30 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.nonConstantImageOffsets = target.nonConstantImageOffsets;
     state.narrowSubgroupClock = target.narrowSubgroupClock;
     state.float64DenormPreserve = target.float64DenormPreserve;
+    state.depthRangeRemap = target.depthRangeRemap;
     state.registrationModules = target.registrationModules;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
+    state.meshBarycentricPixel = target.meshBarycentricPixel;
+    state.meshBarycentricVertex = target.meshBarycentricVertex;
+    state.barycentricSmoothLocation = target.barycentricSmoothLocation;
+    state.barycentricLinearLocation = target.barycentricLinearLocation;
+    state.barycentricPositionsLocation = target.barycentricPositionsLocation;
+    state.meshExportedLocations = target.meshExportedLocations;
+    state.meshPerVertexLocations = target.meshPerVertexLocations;
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.fusedFma = target.fusedFma;
     state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
+    state.robustBufferAccess2 = target.robustBufferAccess2;
+    state.float32FlushToZero = target.float32FlushToZero;
     state.hostSubgroupSize = target.subgroupSize;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };
     state.bindlessWaveUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Compute && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformBallot);
     state.bindlessQuadUniform = state.bindlessImages && program.Resources().stage == IrShaderStage::Pixel && !HostSubgroupSingleLane(state) && supports(spv::CapabilityGroupNonUniformQuad);
+    if (state.requirements.ldsLock && LdsInDeviceMemory(state) && std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != target.supportedCapabilities.end()) {
+        state.requirements.ldsLock = false;
+        state.requirements.ldsBufferInt64Atomics = true;
+    }
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;
         state.requirements.subgroupShuffle = false;
@@ -307,28 +321,14 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
-    // Stopped invocations would leave the wave LDS barriers incomplete.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
-    // APS5_BDA_CONTINUE=<hex address>[,...]: the named programs keep the older fix when they use
-    // wave-level operations (a faulting read continues with zero instead of stopping the invocation),
-    // for giant programs whose #6416 write masks are too expensive to compile (0x800029c200 runs
-    // RADV out of memory). Every other program stops faulting invocations.
-    if (state.bdaStopsInvocations && (state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) {
-        static const std::vector<std::uint64_t> continuing = [] {
-            std::vector<std::uint64_t> addresses;
-            if (const char* text = std::getenv("APS5_BDA_CONTINUE")) {
-                for (const char* at = text; *at != '\0';) {
-                    char* end = nullptr;
-                    const auto address = std::strtoull(at, &end, 16);
-                    if (end == at) break;
-                    addresses.push_back(address);
-                    at = *end == ',' ? end + 1 : end;
-                }
-            }
-            return addresses;
-        }();
-        if (target.bdaContinueWaveOperations || std::find(continuing.begin(), continuing.end(), target.programAddress) != continuing.end()) state.bdaStopsInvocations = false;
-    }
+    // Stopped invocations would leave the wave LDS barriers incomplete. They also break every
+    // wave-level operation of the invocations still running: a lane mask saved in an SGPR before the
+    // stop keeps the stopped lanes' bits, and a waterfall that clears a lane only by its own ballot
+    // vote (s_ff1, v_readlane, s_andn2, s_cbranch_scc1) then never ends. Two lanes per invocation
+    // also stop a lane that did not fault. So only programs whose invocations never look at each
+    // other stop; the others continue with the faulting read's zero, the fault still reported.
+    const bool waveOperations = state.laneCount != 1u || state.requirements.subgroupBallot || state.requirements.subgroupShuffle;
+    state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && !waveOperations && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);

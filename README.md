@@ -135,18 +135,22 @@ Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with
 
 ```
 APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
-APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
+APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
+APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024
 ```
 
 - `APS5_ASYNC_LANE=51` records the cloth compute ring (queue 0x51) on a second Vulkan queue.
 - The first run on a new shader-cache version compiles shaders cold; it can take 30-60 minutes to reach the world.
 - Leave `APS5_PIPELINE_REQUESTS` unset when you measure: it costs about 12 % of a frame here.
-- Every local change has an off switch (`APS5_NO_...`), named in its commit message.
 
 ### Known issues
 
+- **GPU hangs with `APS5_ASYNC_LANE=51`.** With the second queue on, every world run with dispatch overlap hung or hit a GPU write fault within 5-14 minutes: a queue waits 40 s for the GPU, then the device is lost. That held on this build and on the previous one. Three fixes for real cross-queue ordering bugs (each with a test that fails without it) didn't stop it, and neither did serializing the two queues on the GPU. Leave the second queue off until this is found.
+- With the second queue on and dispatch overlap off, we saw one GPU write fault in about 80 minutes of world time.
+- A GPU hang can reset NVIDIA's shader store for the game. After that, the saved pipelines no longer load and every run compiles again (long stalls on the last loading screen). If that happens after a hang, expect one slow run.
 - Black shapes on some rocks and terrain (the depth pre-pass and the G-buffer pass disagree on depth). Cause not found yet.
-- Process memory reaches about 34 GB in the world, so 32 GB of RAM is tight.
+- Process memory is about 30 GB early in the world, so 32 GB of RAM is tight.
+- The overlap fixes keep conflicting dispatches out of overlapped runs, which costs GPU time (about +14 % per frame on the previous build). Frames are CPU-bound, so presents barely move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
 - About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
@@ -174,6 +178,8 @@ APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_A
 # About AnyPS5
 
 Tool for automatic executables porting to Linux and Windows.
+
+The relinker-only build runs on macOS, including Apple silicon.
 
 [**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
 
