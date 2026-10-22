@@ -44,6 +44,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_SAMPLED_LATER_USE_REFUSAL",
     "APS5_NO_IMAGE_SLABS",
     "APS5_NO_PREPARED_TABLE_COUNT",
+    "APS5_NO_SLICE_COPY",
 };
 
 struct Refusal {
