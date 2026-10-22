@@ -303,7 +303,7 @@ void TextureService::workerLoop() {
         // PERF-PLAN: the walk over every table cost ~4% of the process in the world (12.7k tables every
         // 4 ms, under the mutex the draw path's bindless lookups take). APS5_NO_PREPARED_TABLE_COUNT=1
         // walks the tables as before.
-        static const bool scanTables = std::getenv("APS5_NO_PREPARED_TABLE_COUNT") != nullptr;
+        const bool scanTables = RuntimeSwitches::Set(RuntimeSwitch::NoPreparedTableCount);
         const bool work = !missPending.empty() || (scanTables ? std::any_of(tables.begin(), tables.end(), [](const auto& item) { return item.second.state == TableState::Prepared; }) : preparedTables != 0);
         lock.unlock();
         if (!work) continue;
