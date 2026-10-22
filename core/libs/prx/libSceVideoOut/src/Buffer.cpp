@@ -146,6 +146,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     group.attribute = *attribute;
     group.category = category;
     group.occupied = true;
+    static const bool traceDisplay = std::getenv("APS5_TRACE_DISPLAY") != nullptr;
+    if (traceDisplay) std::fprintf(stderr, "[display] RegisterBuffers2 set %d: %d buffers %ux%u pitch %u pixel format 0x%llx tiling %u category %d\n", setIndex, bufferNum, attribute->width, attribute->height, attribute->pitch_in_pixel, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode, category);
     CommitBufferGroup(__func__, *cfg, setIndex, bufferIndexStart, buffers, bufferNum, group);
     return 0;
 } catch (const ProcessShutdown&) {

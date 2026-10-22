@@ -315,6 +315,8 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
   case SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN: *value = SYSTEM_SERVICE_PARAM_ENTER_BUTTON_CROSS; break;
   default: *value = 0; break;
  }
+ static const bool traceDisplay = std::getenv("APS5_TRACE_DISPLAY") != nullptr;
+ if (traceDisplay) std::fprintf(stderr, "[display] SystemServiceParamGetInt id %d -> %d\n", paramId, *value);
  return SYSTEM_SERVICE_OK;
 }
 

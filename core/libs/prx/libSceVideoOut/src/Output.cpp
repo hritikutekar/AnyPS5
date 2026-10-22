@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <cmath>
@@ -17,9 +19,19 @@
 static constexpr std::uint32_t VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD = 0x00FF0000;
 static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
 
+// APS5_TRACE_DISPLAY=1: what the title asks about the display and what it is told (PERF-PLAN 1b).
+static bool traceDisplay() {
+    static const bool trace = std::getenv("APS5_TRACE_DISPLAY") != nullptr;
+    return trace;
+}
+
 static VideoOutOutputStatus outputStatus(const auto& cfg) {
     VideoOutOutputStatus status{};
     status.resolution = (cfg.width >= 3840 || cfg.height >= 2160) ? 2u : 1u;
+    // APS5_DISPLAY_RESOLUTION_STATUS=<n> (experiment, PERF-PLAN 1b): report resolution n instead.
+    static const char* forcedResolution = std::getenv("APS5_DISPLAY_RESOLUTION_STATUS");
+    if (forcedResolution != nullptr) status.resolution = static_cast<decltype(status.resolution)>(std::strtoul(forcedResolution, nullptr, 0));
+    if (traceDisplay()) std::fprintf(stderr, "[display] output status: config %ux%u -> resolution %u, output mode 0x%llx\n", static_cast<unsigned>(cfg.width), static_cast<unsigned>(cfg.height), static_cast<unsigned>(status.resolution), static_cast<unsigned long long>(cfg.outputMode));
     const bool hdr = AgcDriver::CurrentHostHdr().available;
     status.dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
     status.refreshRate = (cfg.outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
@@ -258,6 +270,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
+    if (traceDisplay()) std::fprintf(stderr, "[display] IsOutputSupported mode 0x%llx -> %d\n", static_cast<unsigned long long>(mode), result != 0 ? result : 1);
     if (result != 0) {
         return result;
     }
@@ -279,6 +292,7 @@ int APS5_VABI sceVideoOutConfigureOutput(int handle, uint64_t mode, const VideoO
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     cfg->outputMode = mode;
+    if (traceDisplay()) std::fprintf(stderr, "[display] ConfigureOutput mode 0x%llx\n", static_cast<unsigned long long>(mode));
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
