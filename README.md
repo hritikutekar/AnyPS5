@@ -12,7 +12,7 @@
 | | |
 |---|---|
 | **Furthest point** | Open world (loads from the title screen's Continue) |
-| **Frame rate** | open world about **1.0 fps** at the village gate (9.7–9.9 presents per 10 s, in-run A/Bs best133/best134), with the 1080p game patch below; was about 0.7 fps on 2026-10-20 and 0.9 fps on 2026-10-22 |
+| **Frame rate** | open world about **1.13 fps** at the village gate (11.34 presents per 10 s, run best155), with the 1080p game patch below; was about 0.7 fps on 2026-10-20, 0.9 fps on 2026-10-22 and 1.0 fps on the morning of 2026-10-23 |
 | **Base** | Celegans12's `yotei/best` 233fff3f6 (upstream `main` 2026-10-21, draw-ahead #6188 off by default) |
 | **Needs** | Mesa 26.2.4 with [our ACO patch](docs/yotei-linux/mesa-26.2.4-aco-spill-fixes.patch); without it the GPU faults while the world loads |
 | **Tested on** | CachyOS, kernel 7.2.9, AMD RX 9070 XT (RDNA4, gfx1201), RADV, 32 GB RAM + swap, GCC, Release |
@@ -50,7 +50,8 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 - #6416 BDA fault masks for wave-operation programs, with the older fix kept for the giant programs that blow up memory
   (`APS5_BDA_STOP_WORD_LIMIT`, `APS5_BDA_CONTINUE`).
 - Performance: storage refreshes flush only images whose elements overlap; `APS5_DEFER_REFRESH_FLUSH=1`.
-- Performance, 2026-10-23 (each measured with an in-run A/B and a confirmation run; zero faults, rendering unchanged):
+- Performance, 2026-10-23 (each measured with an in-run A/B, most also with a confirmation run; zero faults, rendering
+  unchanged; each has a runtime switch, so `APS5_AB` can toggle it):
   - BDA address tables merged incrementally: a build changes ~10 of the cached space's ~9,400 ranges, and the whole
     list was rebuilt ~3,400 times every 10 s (~375 us each): **+6–7 %** (`APS5_NO_INCREMENTAL_BDA_RANGES=1` off).
   - The reflection probe the game compresses to BC6H on the GPU each frame is copied into the cached texture on the
@@ -61,12 +62,28 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
     **+2 %** (`APS5_NO_DEPTH_INDEX=1` off).
   - Recorded draws hand the resource sets their cache insert evicts to the release thread, as dispatches already
     did: **+2 %** (`APS5_NO_DEFERRED_DRAW_EVICTION=1` off).
+  - BDA table misses share, recycle and hash their range lists instead of copying them (~3,500 misses every 10 s of a
+    ~300 KiB list): **+9 %** (`APS5_NO_LEAN_BDA_TABLES=1` off).
+  - The buffer pool's small tiers keep 4x their budget: under `APS5_STAGING_POOL_MIB=512` the small device tier
+    (64 MiB) missed and evicted ~5,700 times every 10 s, each a new `VkDeviceMemory` made inside the async compute
+    queues' dispatches, under the GPU mutex: **+4.6 %** (`APS5_NO_LARGER_SMALL_POOLS=1` off). The device tier stays at
+    1x: 4x there took 1.5–2 GiB from the texture caches' VRAM share and made the sampled cache thrash.
+  - Host-imported storage images without 64 KiB block units store without a CPU wait for their writer (their store is
+    recorded on the GPU behind it anyway); the flip waited ~110 ms a present for ~20 such images: **+2.1 %, +2.6 %**
+    (`APS5_NO_DEFER_IMPORTED_STORES=1` off).
+  - Depth-surface lookups skip addresses no surface starts at (`APS5_NO_DEPTH_LOOKUP_FAST=1` off), pending-write
+    scans walk the ~5 distinct ranges instead of ~210 (`APS5_NO_DISTINCT_WRITE_SCANS=1` off), refused hull draws are
+    skipped from a memo instead of serializing a 54–64 KB request each (`APS5_NO_REFUSAL_MEMO=1` off), and
+    `ShaderMemory::collect` merges through a heap (`APS5_NO_COLLECT_HEAP=1` off): **+6.2 %** together (each alone
+    +2.6, +2.5, +2.4 and +1.2 %; the last not significant, its output verified identical).
 - The second Vulkan queue (`APS5_ASYNC_LANE=51`) runs on RADV's compute family (RADV's graphics family has one queue).
 - Texture-cache frame age counts seconds only once presents stand still for 10 s (`APS5_NO_PRESENT_FRAME_AGE=1` off).
 - Driver threads are named on Linux (`agc q0x0`, `agc commit`, …) for `top -H` and `perf`.
 - Controllers without a touchpad: hold View and move the right stick to swipe the touchpad.
-- Diagnostics: `[import-retire]`, `[storage-refresh]`, `[flush-wait]`, `[bad-bda]`, `APS5_BUFFER_VA_HISTORY=1`, and
-  `APS5_SKIP_SHADER=<address,...>`.
+- Diagnostics: `[import-retire]`, `[storage-refresh]`, `[flush-wait]`, `[bad-bda]`, `APS5_BUFFER_VA_HISTORY=1`,
+  `APS5_SKIP_SHADER=<address,...>`; under `APS5_PROFILE_DRAW` also `[invocation-for]`, `[depth-surfaces]`, the
+  `[bufferpool]` evictions by cause and the `[draw] pipelined` write-scan sample; `APS5_VERIFY_COLLECT_HEAP=1` and
+  `APS5_VERIFY_BDA_INCREMENTAL=1` check the new paths against the old ones.
 
 ## Run it on Linux
 
@@ -96,8 +113,12 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 
 ## Known issues
 
-- About 1.0 fps in the open world: per frame about 0.5 s of GPU work, the rest the CPU side. Queue 0's packet worker and
-  the draw committer use about one core together (they take turns), so their per-draw work sets the frame time.
+- About 1.1 fps in the open world: per frame about 0.5 s of GPU work, the rest the CPU side. Queue 0's packet worker and
+  the draw committer use about one core together (they take turns), so their per-draw work sets the frame time. The
+  committer holds the GPU mutex for each draw it records (~90 us), and the worker drains it before most compute
+  dispatches, whose BDA writes aren't known in advance.
+- One run crashed at boot on a zero dword in the title's command buffer ("unsupported PM4 packet type"); the cause is
+  unknown and it hasn't happened again in the runs since.
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
 - Shader `0x80001df900` (clustered-lighting compute pass, 747,518 SPIR-V words) used to hang or fault and was skipped;
   with the ACO LDS spill fix it compiles (about 39 s cold) and runs in the world without faults, so it is no longer skipped.
