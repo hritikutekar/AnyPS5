@@ -1,18 +1,19 @@
 <h1 align="center">Ghost of Yōtei on AnyPS5: Linux / AMD (RADV)</h1>
 
 <p align="center"><b>Celegans12's <a href="https://github.com/Celegans12/AnyPS5/tree/yotei/best"><code>yotei/best</code></a> ported to Linux and AMD, running Ghost of Yōtei (PPSA26344 v02.002) into the open world.</b><br>
-<sub>Branch <code>yotei/linux-best</code> · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">discussion #675</a> · <a href="#run-it-on-linux">run it</a> · <a href="#the-world-load-gpu-fault-was-a-mesa-aco-bug">the world-load crash</a></sub></p>
+<sub>Branch <code>yotei/linux-best-u2</code> · progress thread: <a href="https://github.com/boykopovar/AnyPS5/discussions/675">discussion #675</a> · <a href="#run-it-on-linux">run it</a> · <a href="#the-world-load-gpu-fault-was-a-mesa-aco-bug">the world-load crash</a></sub></p>
 
 > [!NOTE]
 > A work-in-progress test branch, not upstream code: `yotei/best` (Windows) plus the fixes it needs on Linux/RADV,
 > a Mesa patch, and diagnostics. Nothing here has been reviewed upstream.
 
-## Where it stands (2026-10-20)
+## Where it stands (2026-10-23)
 
 | | |
 |---|---|
 | **Furthest point** | Open world (loads from the title screen's Continue) |
-| **Frame rate** | main menu about **4.45 fps** (Performance mode, GPU clock forced high); open world about **0.7 fps** |
+| **Frame rate** | open world about **1.0 fps** at the village gate (9.7–9.9 presents per 10 s, in-run A/Bs best133/best134), with the 1080p game patch below; was about 0.7 fps on 2026-10-20 and 0.9 fps on 2026-10-22 |
+| **Base** | Celegans12's `yotei/best` 233fff3f6 (upstream `main` 2026-10-21, draw-ahead #6188 off by default) |
 | **Needs** | Mesa 26.2.4 with [our ACO patch](docs/yotei-linux/mesa-26.2.4-aco-spill-fixes.patch); without it the GPU faults while the world loads |
 | **Tested on** | CachyOS, kernel 7.2.9, AMD RX 9070 XT (RDNA4, gfx1201), RADV, 32 GB RAM + swap, GCC, Release |
 | **First boot** | long: every shader compiles cold (AnyPS5 translation and Mesa); later boots use both caches |
@@ -49,6 +50,20 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 - #6416 BDA fault masks for wave-operation programs, with the older fix kept for the giant programs that blow up memory
   (`APS5_BDA_STOP_WORD_LIMIT`, `APS5_BDA_CONTINUE`).
 - Performance: storage refreshes flush only images whose elements overlap; `APS5_DEFER_REFRESH_FLUSH=1`.
+- Performance, 2026-10-23 (each measured with an in-run A/B and a confirmation run; zero faults, rendering unchanged):
+  - BDA address tables merged incrementally: a build changes ~10 of the cached space's ~9,400 ranges, and the whole
+    list was rebuilt ~3,400 times every 10 s (~375 us each): **+6–7 %** (`APS5_NO_INCREMENTAL_BDA_RANGES=1` off).
+  - The reflection probe the game compresses to BC6H on the GPU each frame is copied into the cached texture on the
+    GPU instead of written back and re-read (`APS5_NO_SLICE_COPY=1` off); with `APS5_DEFER_REFRESH_FLUSH=1`
+    (now a runtime switch) the per-frame waits for the GPU fall by ~30 %: **+3.3 %**. Both are needed: either alone
+    only moves the wait.
+  - Depth surfaces indexed by address (~270 live surfaces were scanned ~40,000 times a second):
+    **+2 %** (`APS5_NO_DEPTH_INDEX=1` off).
+  - Recorded draws hand the resource sets their cache insert evicts to the release thread, as dispatches already
+    did: **+2 %** (`APS5_NO_DEFERRED_DRAW_EVICTION=1` off).
+- The second Vulkan queue (`APS5_ASYNC_LANE=51`) runs on RADV's compute family (RADV's graphics family has one queue).
+- Texture-cache frame age counts seconds only once presents stand still for 10 s (`APS5_NO_PRESENT_FRAME_AGE=1` off).
+- Driver threads are named on Linux (`agc q0x0`, `agc commit`, …) for `top -H` and `perf`.
 - Controllers without a touchpad: hold View and move the right stick to swipe the touchpad.
 - Diagnostics: `[import-retire]`, `[storage-refresh]`, `[flush-wait]`, `[bad-bda]`, `APS5_BUFFER_VA_HISTORY=1`, and
   `APS5_SKIP_SHADER=<address,...>`.
@@ -67,22 +82,30 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
    VK_ICD_FILENAMES=<mesa>/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json
    APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1 APS5_STAGING_DIFF=1
    APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
-   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200
+   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200 APS5_NO_PRECISE_SMALL_OVERLAP=1
+   APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_STAGING_POOL_MIB=512
    ```
+   `APS5_RESOURCE_CACHE_ENTRIES=1024` matters: without it the resource cache's adaptive capacity often grows to 4096 in
+   the world load, keeps ~2.3 GiB more staging in VRAM and the world runs at about a third of the speed.
+   `APS5_NO_PRECISE_SMALL_OVERLAP=1` keeps the world's colours right (white hair and bleached wood without it).
+4. Optional, +13 % in the world here: shahulmubeen-a's 1080p relinker patch for 02.002.000 (output 3840x2160 ->
+   1920x1080 and the dynamic-resolution table pinned to 1080p), from
+   [#675](https://github.com/boykopovar/AnyPS5/discussions/675#discussioncomment-19114360).
 - Choose **Performance** in the graphics settings; memory is tight with 32 GB, so have swap.
 - For menu benchmarks, force the GPU clock: `echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level`.
 
 ## Known issues
 
-- About 0.7 fps in the open world: per frame about 0.5 s of GPU work plus about 1 s of GPU idle waiting on the CPU side.
-  Profiling is next; the goal is 30 fps.
+- About 1.0 fps in the open world: per frame about 0.5 s of GPU work, the rest the CPU side. Queue 0's packet worker and
+  the draw committer use about one core together (they take turns), so their per-draw work sets the frame time.
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
 - Shader `0x80001df900` (clustered-lighting compute pass, 747,518 SPIR-V words) used to hang or fault and was skipped;
   with the ACO LDS spill fix it compiles (about 39 s cold) and runs in the world without faults, so it is no longer skipped.
 
 ## Credits
 
-Celegans12 (`yotei/best`, the base of this branch), Pipodi, ee6aba54, pushkarreddyy, teepean, JJenkx (#6721), danielcadev,
+Celegans12 (`yotei/best`, the base of this branch), shahulmubeen-a (1080p patch, #9600), mitul72 (#6188), Pipodi,
+ee6aba54, pushkarreddyy, teepean, JJenkx (#6721), danielcadev,
 and everyone in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
 ---
