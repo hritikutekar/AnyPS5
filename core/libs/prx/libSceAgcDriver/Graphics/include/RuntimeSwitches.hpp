@@ -44,7 +44,6 @@ enum class RuntimeSwitch : std::size_t {
     SampledLaterUseRefusal,
     NoImageSlabs,
     NoPreparedTableCount,
-    NoSliceCopy,
     Count,
 };
 
