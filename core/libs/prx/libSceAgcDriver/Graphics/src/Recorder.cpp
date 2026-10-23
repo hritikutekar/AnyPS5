@@ -39,6 +39,9 @@
 #include <utility>
 #include <unordered_map>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -458,6 +461,9 @@ ReleaseQueue& ReleaseThreadQueue() {
 }
 
 void ReleaseThreadMain() {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "agc release");
+#endif
     CpuTopology::PinHelperThread("release thread");
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
@@ -1127,6 +1133,9 @@ struct Recorder::ProgressWatcher {
     ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
         thread = std::thread([this, device, timeline, waitSemaphores, counterValue] {
             CpuTopology::PinHelperThread("GPU progress watcher");
+#ifdef __linux__
+            pthread_setname_np(pthread_self(), "agc progress");
+#endif
             std::uint64_t seen = 0;
             for (;;) {
                 {

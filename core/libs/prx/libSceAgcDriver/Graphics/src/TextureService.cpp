@@ -13,6 +13,9 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -271,6 +274,9 @@ void TextureService::readTable(Tracked& tracked) {
 }
 
 void TextureService::workerLoop() {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "agc texsvc");
+#endif
     while (true) {
         Lock lock(mutex);
         changed.wait_for(lock, std::chrono::milliseconds(4), [&] { return stopping || !queue.empty(); });

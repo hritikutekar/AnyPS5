@@ -51,6 +51,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -2374,6 +2377,9 @@ private:
         for (unsigned i = 0; i < wanted; ++i) {
             threads.emplace_back([this](std::stop_token token) {
                 CpuTopology::PinHelperThread("mirror refresh");
+#ifdef __linux__
+                pthread_setname_np(pthread_self(), "agc mirror");
+#endif
                 helper(token);
             });
             ++helpers;
