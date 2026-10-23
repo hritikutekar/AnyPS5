@@ -133,9 +133,7 @@ private:
     };
     // The byte budget Put holds a tier to: the small tiers' at 4x (best151: the 64 MiB small device tier missed
     // and evicted ~5,700 times a 10 s, each a new VkDeviceMemory, ~17 % of an async compute queue's time in
-    // libdrm's VA allocator under the GPU mutex). APS5_NO_LARGER_SMALL_POOLS=1 (runtime switch) keeps 1x. The device
-    // tier's too (with the small ones at 4x it still missed and evicted ~1,100 times a 10 s by budget, best152);
-    // APS5_NO_LARGER_DEVICE_POOL=1 (runtime switch) keeps it at 1x. VRAM over its target still drops (vram.Excess).
+    // libdrm's VA allocator under the GPU mutex). APS5_NO_LARGER_SMALL_POOLS=1 (runtime switch) keeps 1x.
     VkDeviceSize retentionBudget(const Tier& tier) const;
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
