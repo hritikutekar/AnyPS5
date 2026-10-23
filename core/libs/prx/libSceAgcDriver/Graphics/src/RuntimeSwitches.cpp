@@ -47,6 +47,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_OVERLAP_RANGE_CHECK",
     "APS5_NO_DRAW_AHEAD",
     "APS5_NO_SLICE_COPY",
+    "APS5_DEFER_REFRESH_FLUSH",
 };
 
 struct Refusal {
