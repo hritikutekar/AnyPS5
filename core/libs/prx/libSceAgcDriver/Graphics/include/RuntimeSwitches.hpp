@@ -59,6 +59,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDistinctWriteScans,
     NoCollectHeap,
     NoLargerSmallPools,
+    NoLargerDevicePool,
     Count,
 };
 
