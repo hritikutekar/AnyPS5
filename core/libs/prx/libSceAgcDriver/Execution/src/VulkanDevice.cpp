@@ -4193,9 +4193,14 @@ void VulkanDevice::BindlessPresentWait() {
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
+    std::optional<Graphics::Context> built;
+    return graphicsContext(built);
+}
+
+const Graphics::Context& VulkanDevice::graphicsContext(std::optional<Graphics::Context>& built) const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    return buildContext();
+    return built.emplace(buildContext());
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -4309,7 +4314,8 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
+    std::optional<Graphics::Context> built;
+    return Graphics::KnownValidationFailure(graphicsContext(built), shaders, graphics);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
@@ -4354,7 +4360,12 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, Graphics::PreparedDraw* prepared) {
+std::shared_ptr<const Graphics::AheadDraw> VulkanDevice::PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    std::optional<Graphics::Context> built;
+    return Graphics::PrepareAheadDraw(graphicsContext(built), graphics, shaders);
+}
+
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, Graphics::PreparedDraw* prepared, const Graphics::AheadDraw* ahead) {
     startJournalReplay();
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
@@ -4364,8 +4375,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared);
+    std::optional<Graphics::Context> built;
+    Graphics::Draw(graphicsContext(built), graphics, draw, shaders, snapshots, recipe, prepared, ahead);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
@@ -5010,8 +5021,8 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
-    const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
+    std::optional<Graphics::Context> built;
+    const auto outcome = Graphics::DrawWithRecipe(graphicsContext(built), graphics, draw, shaders, snapshots, *recipe);
     if (!outcome.recorded) {
         switch (outcome.miss) {
             case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
@@ -5335,6 +5346,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             d.overlapReport = now;
             const auto flushes = Graphics::Recorder::DeferredFlushCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
+            const auto range = Graphics::Recorder::RangeCheckCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[overlap-range] (cumulative) joins refused by the access-range check %llu; range conflicts joined while APS5_NO_OVERLAP_RANGE_CHECK was set %llu (now %s)\n", static_cast<unsigned long long>(range[0]), static_cast<unsigned long long>(range[1]), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOverlapRangeCheck) ? "set" : "unset");
             const auto batched = Graphics::Recorder::BatchedStagingCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[batched-staging] (APS5_NO_BATCHED_STAGING %s, cumulative) %llu run splits, %llu preludes with %llu copy-in builds and %llu pristine copies; %llu copy-backs after a run sharing its barrier (%llu after an overlapping one); unordered dispatches not overlapped: no open run %llu, other ring's run %llu, render pass %llu, store run %llu, resources already in the run %llu\n", Graphics::Recorder::BatchedStagingEnabled() ? "unset" : "set", static_cast<unsigned long long>(batched.splits), static_cast<unsigned long long>(batched.preludes), static_cast<unsigned long long>(batched.preludeCopies), static_cast<unsigned long long>(batched.pristineCopies), static_cast<unsigned long long>(batched.mergedCopyBacks), static_cast<unsigned long long>(batched.copyBackConflicts), static_cast<unsigned long long>(batched.lostNoRun), static_cast<unsigned long long>(batched.lostOtherQueue), static_cast<unsigned long long>(batched.lostRenderPass), static_cast<unsigned long long>(batched.lostStoreRun), static_cast<unsigned long long>(batched.lostOwner));
             std::string sites;
@@ -5384,6 +5397,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
+    if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
