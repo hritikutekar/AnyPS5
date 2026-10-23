@@ -3413,6 +3413,18 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             ++gpuDumps;
         }
     }
+    // APS5_LOG_PRESENTS=1 without APS5_PROFILE_DRAW: the present count alone every 10 s, in the [flip] form the
+    // tools parse plus the seconds since the first present, so a run can be timed without the profile's own
+    // timers (~9 % of the queue-0 worker's and the committer's CPU in best116).
+    static const bool logPresents = std::getenv("APS5_LOG_PRESENTS") != nullptr;
+    if (!profile && logPresents) {
+        static const auto first = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport > std::chrono::seconds(10)) {
+            lastReport = now;
+            std::fprintf(stderr, "[flip] (cumulative): %llu presents (t %.3f s)\n", static_cast<unsigned long long>(residentPresents), std::chrono::duration<double>(now - first).count());
+        }
+    }
     if (profile && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
         lastReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[flip] (cumulative): %llu presents from the resident image (%llu refreshed first), through guest memory: %llu not pending, %llu unsuitable; %llu GPU frame dumps\n", static_cast<unsigned long long>(residentPresents), static_cast<unsigned long long>(refreshedPresents), static_cast<unsigned long long>(notPending), static_cast<unsigned long long>(unsuitable), static_cast<unsigned long long>(gpuDumps));
