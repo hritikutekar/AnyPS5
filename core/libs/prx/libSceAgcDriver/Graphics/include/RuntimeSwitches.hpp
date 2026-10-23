@@ -50,6 +50,7 @@ enum class RuntimeSwitch : std::size_t {
     NoSliceCopy,
     DeferRefreshFlush,
     DeferFlipStore,
+    NoDepthIndex,
     Count,
 };
 
