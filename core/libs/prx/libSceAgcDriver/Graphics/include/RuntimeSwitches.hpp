@@ -55,6 +55,7 @@ enum class RuntimeSwitch : std::size_t {
     NoIncrementalBdaRanges,
     NoLeanBdaTables,
     NoDepthLookupFast,
+    NoRefusalMemo,
     Count,
 };
 
