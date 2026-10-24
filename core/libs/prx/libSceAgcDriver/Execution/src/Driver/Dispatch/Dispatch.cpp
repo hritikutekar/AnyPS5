@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -42,20 +43,14 @@ bool DispatchUsesImages(const ShaderRecompiler::RecompileResult& compiled) {
     return false;
 }
 
+// APS5_PIPELINE_DISPATCH / APS5_PIPELINE_DISPATCH_MISSES (runtime switches, opt-in: an APS5_AB can
+// toggle them; each dispatch reads them once): queue 0's dispatches as draw-pipeline items.
 bool DispatchItemsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return enabled;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch);
 }
 
 bool DispatchMissItemsEnabled() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_PIPELINE_DISPATCH_MISSES");
-        return DispatchItemsEnabled() && text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return enabled;
+    return DispatchItemsEnabled() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
 }
 
 bool NoDispatchItems() {
