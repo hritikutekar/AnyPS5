@@ -347,8 +347,10 @@ void Driver::execute(const Submission& submission) {
     static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
     if (static_cast<long>(submission.queue) == dumpQueue) {
 
-        static int dumped = 0;
-        if (dumped++ < 40) {
+        // APS5_DUMP_QUEUE_SKIP=<n>: the first n submissions of the queue are not dumped (to reach gameplay).
+        static const long skip = [] { const char* text = std::getenv("APS5_DUMP_QUEUE_SKIP"); return text ? std::strtol(text, nullptr, 10) : 0L; }();
+        static long dumped = 0;
+        if (dumped++ >= skip && dumped <= skip + 40) {
             std::string text = "[queue] submission " + std::to_string(submission.serial) + ":\n";
             for (std::size_t cursor = 0; cursor < submission.commands.size();) {
                 const auto header = submission.commands[cursor];
