@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4979,23 +4980,66 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     }
 }
 
+namespace {
+// Diagnostic (APS5_PROFILE_DRAW): completeSpaceWrites calls, how many took the shortcut, time; every 10 s.
+struct SpaceWriteCounts {
+    std::atomic<std::uint64_t> calls{0}, shortcuts{0}, syncs{0}, ns{0};
+    std::atomic<std::int64_t> last{0};
+};
+
+void NoteSpaceWrites(bool shortcut, std::uint64_t syncs, std::uint64_t ns) {
+    static SpaceWriteCounts counts;
+    counts.calls.fetch_add(1, std::memory_order_relaxed);
+    if (shortcut) counts.shortcuts.fetch_add(1, std::memory_order_relaxed);
+    counts.syncs.fetch_add(syncs, std::memory_order_relaxed);
+    counts.ns.fetch_add(ns, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = counts.last.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counts.last.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !counts.last.compare_exchange_strong(last, now)) return;
+    const auto calls = counts.calls.exchange(0);
+    const auto shortcuts = counts.shortcuts.exchange(0);
+    const auto taken = counts.syncs.exchange(0);
+    const auto spent = static_cast<double>(counts.ns.exchange(0));
+    std::fprintf(stderr, "[space-writes] (10 s) %llu calls, %llu with no copied writer, draw writer or completion label (shortcut %s), %.1f ms (%.2f us each), syncs %llu\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(shortcuts), RuntimeSwitches::Set(RuntimeSwitch::NoSpaceWritesShortcut) ? "off" : "on", spent / 1e6, calls != 0 ? spent / 1e3 / static_cast<double>(calls) : 0.0, static_cast<unsigned long long>(taken));
+}
+}
+
 void GuestBufferMemory::completeSpaceWrites() const {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // CompletePendingCpuWrites completes nothing for any region while no copied writer, draw writer or
+    // completion label is pending, and nothing below changes that except its own sync: then gathering
+    // every pending write range of every open and in-flight batch and searching the space for each is
+    // wasted (38k of 38k calls per 10 s at the village gate, ~12 us each, best229).
+    // APS5_NO_SPACE_WRITES_SHORTCUT=1 (runtime switch) always scans, as before.
+    const bool idle = (context.copiedWriters == nullptr || context.copiedWriters->empty()) && DrawCopiedWriters()->empty() && Recorder::PendingCompletionLabels() == 0;
+    if (idle && !RuntimeSwitches::Set(RuntimeSwitch::NoSpaceWritesShortcut)) {
+        if (profile) NoteSpaceWrites(true, 0, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+        return;
+    }
     const auto& base = space->base;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::size_t> candidates;
     std::size_t next = 0;
+    std::uint64_t syncs = 0;
     while (next < base.size()) {
         recorder->PendingWriteRanges(writes);
         OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
         next = base.size();
         for (const auto index : candidates) {
             if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
+            ++syncs;
             next = index + 1;
             break;
         }
     }
+    if (profile) NoteSpaceWrites(idle, syncs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
 }
 
 void GuestBufferMemory::UploadFinish(bool addressable) {
