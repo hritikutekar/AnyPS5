@@ -1639,6 +1639,90 @@ struct ResourceUse {
 
 // The [gputime] key of a draw's pass: the draw class, or under APS5_PROFILE_GPU_ATTRIB=1 (diagnostic)
 // the program recording it (Recorder::CurrentWriteOrigin) with bit 62 set, so passes rank by program.
+// Diagnostic (APS5_PROFILE_GPU_ATTRIB=1): the shape of the render passes, by the program that began
+// each (the [gputime] key): passes, draws and distinct programs per pass, first colour target and depth
+// target. Recorded on the committer; printed every 10 s for the pass-start programs with most passes.
+std::array<std::atomic<std::uint64_t>, 6> passForced{};
+
+void NotePassForced(bool capture, bool readsTarget, bool gpuIndirect, bool meshIndirect, bool blended, bool heap) {
+    const std::array<bool, 6> why{capture, readsTarget, gpuIndirect, meshIndirect, blended, heap};
+    for (std::size_t i = 0; i < why.size(); ++i) {
+        if (why[i]) passForced[i].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+struct PassShape {
+    std::uint64_t passes = 0, draws = 0, programs = 0;
+    std::string target;
+};
+
+void NotePassDraw(bool begun, std::uint64_t program, std::uint32_t colorWidth, std::uint32_t colorHeight, std::uint32_t colorFormat, std::uint32_t colors, const std::optional<DepthTarget>& depth) {
+    static std::mutex mutex;
+    static std::map<std::uint64_t, PassShape> shapes;
+    static std::uint64_t current = 0, currentDraws = 0;
+    static std::set<std::uint64_t> currentPrograms;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    if (begun) {
+        if (current != 0 || currentDraws != 0) {
+            auto& shape = shapes[current];
+            ++shape.passes;
+            shape.draws += currentDraws;
+            shape.programs += currentPrograms.size();
+        }
+        current = program;
+        currentDraws = 0;
+        currentPrograms.clear();
+        auto& shape = shapes[program];
+        if (shape.target.empty()) {
+            char text[160];
+            if (depth.has_value()) std::snprintf(text, sizeof(text), "%u colour(s) %ux%u fmt %u, depth %ux%u vk %d", colors, colorWidth, colorHeight, colorFormat, depth->extent.width, depth->extent.height, static_cast<int>(depth->format));
+            else std::snprintf(text, sizeof(text), "%u colour(s) %ux%u fmt %u, no depth", colors, colorWidth, colorHeight, colorFormat);
+            shape.target = text;
+        }
+    }
+    ++currentDraws;
+    currentPrograms.insert(program);
+    if (std::chrono::steady_clock::now() - lastReport < std::chrono::seconds(10)) return;
+    lastReport = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+    for (const auto& [key, shape] : shapes) top.emplace_back(shape.passes, key);
+    std::sort(top.rbegin(), top.rend());
+    std::string list;
+    for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+        const auto& shape = shapes[top[i].second];
+        char text[320];
+        std::snprintf(text, sizeof(text), "\n  0x%llx: %llu passes, %.1f draws and %.1f programs each, %s", static_cast<unsigned long long>(top[i].second), static_cast<unsigned long long>(shape.passes), shape.passes != 0 ? static_cast<double>(shape.draws) / static_cast<double>(shape.passes) : 0.0, shape.passes != 0 ? static_cast<double>(shape.programs) / static_cast<double>(shape.passes) : 0.0, shape.target.c_str());
+        list += text;
+    }
+    static const std::uint64_t named = [] { const char* text = std::getenv("APS5_PROFILE_PASS_PROGRAM"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    if (named != 0) {
+        if (const auto found = shapes.find(named); found != shapes.end()) {
+            const auto& shape = found->second;
+            char text[320];
+            std::snprintf(text, sizeof(text), "\n  named 0x%llx: %llu passes, %.1f draws and %.1f programs each, %s", static_cast<unsigned long long>(named), static_cast<unsigned long long>(shape.passes), shape.passes != 0 ? static_cast<double>(shape.draws) / static_cast<double>(shape.passes) : 0.0, shape.passes != 0 ? static_cast<double>(shape.programs) / static_cast<double>(shape.passes) : 0.0, shape.target.c_str());
+            list += text;
+        }
+    }
+    static std::array<std::uint64_t, 11> lastBreaks{};
+    static std::array<std::uint64_t, 6> lastForced{};
+    const auto breaks = Recorder::PassBreakCounts();
+    std::array<std::uint64_t, 11> b{};
+    for (std::size_t i = 0; i < b.size(); ++i) b[i] = breaks[i] - lastBreaks[i];
+    lastBreaks = breaks;
+    std::array<std::uint64_t, 6> f{};
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        const auto now = passForced[i].load(std::memory_order_relaxed);
+        f[i] = now - lastForced[i];
+        lastForced[i] = now;
+    }
+    std::string closers;
+    for (const auto& [site, count] : Recorder::TakePassCloseSites(8)) closers += "\n  " + std::to_string(count) + " " + site;
+    std::fprintf(stderr, "[pass-closers] (10 s) Commands() calls that ended an open render pass, by caller:%s\n", closers.c_str());
+    std::fprintf(stderr, "[pass-shapes] (10 s, by the program that began the pass):%s\n[pass-breaks] (10 s) draws continuing a pass %llu; new passes: none open %llu, forced %llu (capture %llu, reads target %llu, gpu indirect %llu, mesh indirect %llu, blended %llu, heap %llu), sample segment %llu, another key %llu, hazards RAW %llu WAW %llu WAR %llu image %llu unknown read %llu unknown write %llu\n", list.c_str(), static_cast<unsigned long long>(b[0]), static_cast<unsigned long long>(b[1]), static_cast<unsigned long long>(b[2]), static_cast<unsigned long long>(f[0]), static_cast<unsigned long long>(f[1]), static_cast<unsigned long long>(f[2]), static_cast<unsigned long long>(f[3]), static_cast<unsigned long long>(f[4]), static_cast<unsigned long long>(f[5]), static_cast<unsigned long long>(b[3]), static_cast<unsigned long long>(b[4]), static_cast<unsigned long long>(b[5]), static_cast<unsigned long long>(b[6]), static_cast<unsigned long long>(b[7]), static_cast<unsigned long long>(b[8]), static_cast<unsigned long long>(b[9]), static_cast<unsigned long long>(b[10]));
+    shapes.clear();
+}
+
 std::uint64_t DrawTimingKey() {
     static const bool byProgram = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
     if (!byProgram) return Recorder::ClassKey(Recorder::CommandClass::Draw);
@@ -2286,9 +2370,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
+    static const bool passShapeCounts = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
+    if (passShapeCounts) NotePassForced(capture, readsTarget, gpuIndirect, meshIndirect, record.blended != nullptr, heap);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
+    static const bool passShapes = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
+    if (passShapes) {
+        const auto* first = record.targets.empty() ? nullptr : record.targets.front().get();
+        const auto described = first != nullptr ? first->Descriptor() : GuestTextureResource{};
+        NotePassDraw(!continued, Recorder::CurrentWriteOrigin(), first != nullptr ? described.width : 0u, first != nullptr ? described.height : 0u, first != nullptr ? described.format : 0u, static_cast<std::uint32_t>(record.targets.size()), state.depth);
+    }
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;

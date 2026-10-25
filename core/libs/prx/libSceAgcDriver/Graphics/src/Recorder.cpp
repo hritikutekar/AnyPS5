@@ -2235,7 +2235,11 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) {
+        static const bool closeSites = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
+        if (closeSites) NotePassClose(where);
+        endOpenRenderPass();
+    }
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -2246,6 +2250,36 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, 11> passBreaks{};
+std::mutex passCloseMutex;
+std::map<std::string, std::uint64_t> passCloseSites;
+}
+
+void Recorder::NotePassClose(const std::source_location& where) {
+    const char* file = where.file_name();
+    if (const char* slash = std::strrchr(file, '/')) file = slash + 1;
+    std::string site = std::string(file) + ":" + std::to_string(where.line()) + " " + where.function_name();
+    if (site.size() > 120) site.resize(120);
+    std::lock_guard lock(passCloseMutex);
+    ++passCloseSites[site];
+}
+
+std::vector<std::pair<std::string, std::uint64_t>> Recorder::TakePassCloseSites(std::size_t limit) {
+    std::lock_guard lock(passCloseMutex);
+    std::vector<std::pair<std::string, std::uint64_t>> sites(passCloseSites.begin(), passCloseSites.end());
+    passCloseSites.clear();
+    std::sort(sites.begin(), sites.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (sites.size() > limit) sites.resize(limit);
+    return sites;
+}
+
+std::array<std::uint64_t, 11> Recorder::PassBreakCounts() {
+    std::array<std::uint64_t, 11> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = passBreaks[i].load(std::memory_order_relaxed);
+    return counts;
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where) {
     ensureOpen();
     takeOwedEdge();
@@ -2253,13 +2287,18 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     flushDeferredDispatch(1, where);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        passBreaks[!pass.open ? 1 : forced ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        passBreaks[0].fetch_add(1, std::memory_order_relaxed);
+        return {open->commands, true, false};
+    }
+    passBreaks[hazard == PassHazard::None ? 4 : 4 + static_cast<std::size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);

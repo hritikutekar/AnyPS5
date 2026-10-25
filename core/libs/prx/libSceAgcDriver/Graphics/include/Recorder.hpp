@@ -269,6 +269,13 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
+    // Diagnostic counts of StartDrawPass outcomes (cumulative): continued, no pass open, forced, sample
+    // segment, another pass key without a hazard, then the hazards by PassHazard (RAW, WAW, WAR, image,
+    // unknown read, unknown write).
+    static std::array<std::uint64_t, 11> PassBreakCounts();
+    // Diagnostic (APS5_PROFILE_GPU_ATTRIB): the call sites whose Commands() ended an open render pass,
+    // most first, since the last call (cleared).
+    static std::vector<std::pair<std::string, std::uint64_t>> TakePassCloseSites(std::size_t limit);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     void SealPassWriteOnly();
@@ -1070,6 +1077,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
+    static void NotePassClose(const std::source_location& where);
     void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
