@@ -612,7 +612,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
+        // A depth-clear dispatch notes its HTILE mask as the miss item and the direct path do, so the
+        // next depth draw's store-back knows the newest writer of the range instead of pre-syncing
+        // on the whole GPU (found by shahulmubeen-a; APS5_NO_HIT_ITEM_HTILE_NOTE=1 off, a runtime switch).
+        const bool noteHtile = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHitItemHtileNote);
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileMask, noteHtile] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -643,6 +647,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), &builtRecipe);
                     }
+                    if (noteHtile && htileMask.address != 0) localDevice->NoteHtileMask(htileMask.address, htileMask.bytes, htileMask.mask, htileMask.value);
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
