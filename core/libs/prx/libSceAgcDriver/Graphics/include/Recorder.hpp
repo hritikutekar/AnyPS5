@@ -276,6 +276,8 @@ public:
     // Diagnostic (APS5_PROFILE_GPU_ATTRIB): the call sites whose Commands() ended an open render pass,
     // most first, since the last call (cleared).
     static std::vector<std::pair<std::string, std::uint64_t>> TakePassCloseSites(std::size_t limit);
+    // Whether a draw's render pass is open in the batch being recorded (diagnostics).
+    bool RenderPassOpen() const;
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     void SealPassWriteOnly();

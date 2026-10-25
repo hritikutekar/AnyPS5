@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -103,8 +105,39 @@ std::uint32_t BindlessTable::Retire(const std::function<bool(const Key&, const D
     return dropped;
 }
 
+namespace {
+// Diagnostic (APS5_PROFILE_GPU_ATTRIB=1): what each publication found, split by whether a draw's render
+// pass was open when it ran (taking the command buffer ends that pass). Printed every 10 s.
+struct PublishCounts {
+    std::array<std::uint64_t, 2> all{}, idle{}, assign{}, grown{}, rebuilt{}, changed{}, clear{};
+    std::uint64_t changedBuckets = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+void NotePublish(bool passOpen, bool assign, bool grown, bool rebuilt, std::size_t changed, bool clear) {
+    static PublishCounts counts;
+    const auto at = passOpen ? 1u : 0u;
+    ++counts.all[at];
+    if (!assign && !rebuilt && changed == 0 && !clear) ++counts.idle[at];
+    if (assign) ++counts.assign[at];
+    if (grown) ++counts.grown[at];
+    if (rebuilt) ++counts.rebuilt[at];
+    if (changed != 0) ++counts.changed[at];
+    if (clear) ++counts.clear[at];
+    counts.changedBuckets += changed;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - counts.last < std::chrono::seconds(10)) return;
+    const auto u = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+    std::fprintf(stderr, "[bindless-publish] (10 s) publications %llu with a pass open / %llu without: nothing to record %llu / %llu, ring assigned (new batch) %llu / %llu, table grown %llu / %llu, rebuilt %llu / %llu, changed buckets %llu / %llu (%llu buckets), seen cleared %llu / %llu\n", u(counts.all[1]), u(counts.all[0]), u(counts.idle[1]), u(counts.idle[0]), u(counts.assign[1]), u(counts.assign[0]), u(counts.grown[1]), u(counts.grown[0]), u(counts.rebuilt[1]), u(counts.rebuilt[0]), u(counts.changed[1]), u(counts.changed[0]), u(counts.changedBuckets), u(counts.clear[1]), u(counts.clear[0]));
+    counts = PublishCounts{};
+    counts.last = now;
+}
+}
+
 void BindlessTable::Publish(Recorder& recorder) {
     std::lock_guard lock(mutex);
+    static const bool countPublishes = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
+    const bool passOpen = countPublishes && recorder.RenderPassOpen();
     heap.Collect(recorder.CompletedThrough());
     if (recorder.HasQueuedKeyStores()) recorder.FlushKeyStores();
     // APS5_QUIET_PUBLISH=1 (opt-in, an APS5_AB switch): a publication with nothing to record (the
@@ -128,6 +161,7 @@ void BindlessTable::Publish(Recorder& recorder) {
         clear = std::exchange(rings->clearSeen, false);
     }
     ++totals.publications;
+    if (countPublishes) NotePublish(passOpen, assign, grown, rebuilt, changed.size(), clear);
     if (!assign && !rebuilt && changed.empty() && !clear) return;
     if (quiet) commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
