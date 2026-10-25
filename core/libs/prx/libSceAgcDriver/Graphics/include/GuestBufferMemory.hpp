@@ -360,6 +360,10 @@ public:
         // freed allocation waited 60 s for that pin and aborted); the space's list is cached about once per space
         // and is copied.
         std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> owner;
+        // A merged list's table-cache hash: the space's serial and this build's key (its own regions
+        // and writes), which within one space determine the list, so BdaResources need not hash its
+        // ~9,400 ranges (a match is still compared range by range). 0 for the space's own list.
+        std::uint64_t keyHash = 0;
     };
     std::optional<CachedTable> CachedAddressTable() const;
     // The registered memory an address-based build maps, shared by consecutive builds (see
@@ -574,6 +578,7 @@ private:
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
     mutable std::uint64_t tableSerial = 0;
+    mutable std::uint64_t tableKeyHash = 0;
     mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> tableRanges;
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.

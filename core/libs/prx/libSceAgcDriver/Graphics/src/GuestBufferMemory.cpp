@@ -6077,7 +6077,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges, nullptr};
-    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get(), tableRanges};
+    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get(), tableRanges, tableKeyHash};
     const auto& spaceRanges = space->ranges;
     const bool inWritable = regions.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
         auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
@@ -6096,6 +6096,18 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     for (const auto& region : regions) own.push_back(addressRange(region));
     auto key = AddressTableKey(writes, own);
     addressTableTimes().keyWords.fetch_add(key.size(), std::memory_order_relaxed);
+    {
+        // splitmix64 over the space's serial and the key words; never 0 (0 means "hash the ranges").
+        auto mix = [](std::uint64_t value) {
+            value += 0x9e3779b97f4a7c15ull;
+            value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+            value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+            return value ^ (value >> 31);
+        };
+        std::uint64_t hash = mix(space->serial);
+        for (const auto word : key) hash = mix(hash ^ word);
+        tableKeyHash = hash | 1u;
+    }
     static const bool verify = std::getenv("APS5_VERIFY_BDA_TABLES") != nullptr;
     std::lock_guard lock(space->tableMutex);
     const auto found = space->tables.find(key);
@@ -6147,7 +6159,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
         (found != space->tables.end() ? t.hitNs : t.missNs).fetch_add(ns, std::memory_order_relaxed);
     }
     reportAddressTableTimes();
-    return CachedTable{tableSerial, tableRanges.get(), tableRanges};
+    return CachedTable{tableSerial, tableRanges.get(), tableRanges, tableKeyHash};
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {

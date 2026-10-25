@@ -289,7 +289,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             }
         }
         const auto hashStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        hash = lean ? hashRangesLanes(ranges) : hashRanges(ranges);
+        // APS5_NO_BDA_KEY_HASH=1 (runtime switch): hash the merged list's ranges as before.
+        if (cached.has_value() && cached->keyHash != 0 && !RuntimeSwitches::Set(RuntimeSwitch::NoBdaKeyHash)) hash = cached->keyHash;
+        else hash = lean ? hashRangesLanes(ranges) : hashRanges(ranges);
         classifyFirstEntry(cache, hash, ranges);
         const auto scanStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (profiled) bdaBuildTimes().hashNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(scanStart - hashStart).count()), std::memory_order_relaxed);
