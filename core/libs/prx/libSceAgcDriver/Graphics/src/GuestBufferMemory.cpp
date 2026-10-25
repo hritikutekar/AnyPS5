@@ -150,6 +150,11 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> dissolvedOverlap{0};
     std::atomic<std::uint64_t> dissolvedImports{0};
     std::atomic<std::uint64_t> waiterDrops{0};
+    // Diagnostic for a pin wait that does not end ([pin-holders]): every published space, weakly, with
+    // when it was published; pruned of expired ones as it grows.
+    std::mutex liveMutex;
+    std::vector<std::pair<std::weak_ptr<const GuestBufferMemory::AddressSpace>, std::chrono::steady_clock::time_point>> live;
+    std::size_t livePruneAt = 256;
 };
 
 AddressSpaceCache& Spaces() {
@@ -2981,8 +2986,38 @@ bool liveSnapshotCompared(std::uint64_t address, std::size_t bytes) {
     return checkLive && !AnyShadowedOverlaps(address, bytes);
 }
 
+// [pin-holders] driver side: the live address spaces whose lease holds [address, address + bytes), with
+// their age and holder count (the cache, builds, prepared items and batches each hold one).
+void reportSpaceHolders(std::uintptr_t address, std::size_t bytes, int rounds) {
+    auto& spaces = Spaces();
+    const auto current = spaces.current.load();
+    const auto now = std::chrono::steady_clock::now();
+    const auto end = static_cast<std::uint64_t>(address) + bytes;
+    std::lock_guard liveLock(spaces.liveMutex);
+    std::size_t live = 0, holding = 0;
+    for (const auto& [weak, made] : spaces.live) {
+        const auto space = weak.lock();
+        if (space == nullptr) continue;
+        ++live;
+        const bool holds = std::any_of(space->lease.begin(), space->lease.end(), [&](const auto& range) { return range->address < end && address < range->address + range->bytes; });
+        if (!holds || ++holding > 16) continue;
+        std::fprintf(stderr, "[pin-holders]   space serial %llu, age %.1f s, %ld holders besides this check%s\n", static_cast<unsigned long long>(space->serial), std::chrono::duration<double>(now - made).count(), space.use_count() - 1 - (space == current ? 1 : 0), space == current ? " (and the cache)" : "");
+    }
+    std::fprintf(stderr, "[pin-holders]   driver, after %d waiter rounds: %zu live address spaces, %zu hold 0x%llx+0x%llx\n", rounds, live, holding, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+}
+
 bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     const auto start = std::chrono::steady_clock::now();
+    {
+        // Rounds for the same range back to back: a census at 8, 64, 512, 4096 and 32768.
+        static thread_local std::pair<std::uintptr_t, std::size_t> waitingFor{};
+        static thread_local int rounds = 0;
+        if (waitingFor != std::make_pair(address, bytes)) {
+            waitingFor = {address, bytes};
+            rounds = 0;
+        }
+        if (++rounds == 8 || rounds == 64 || rounds == 512 || rounds == 4096 || rounds == 32768) reportSpaceHolders(address, bytes, rounds);
+    }
     bool synced = false;
     bool drained = false;
     bool retiredImport = false;
@@ -3054,9 +3089,8 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             recorder->Sync();
             synced = true;
             drained = true;
-        } else {
-            std::this_thread::yield();
         }
+        // Nothing to finish: no yield here, under the GPU mutex; the registry backs off unlocked.
         if (recorder != nullptr) recorder->FlushDeferredReleases();
 
         const auto end = static_cast<std::uint64_t>(address) + bytes;
@@ -4081,6 +4115,14 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->device = context.device;
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
+                {
+                    std::lock_guard liveLock(spaces.liveMutex);
+                    if (spaces.live.size() >= spaces.livePruneAt) {
+                        std::erase_if(spaces.live, [](const auto& entry) { return entry.first.expired(); });
+                        spaces.livePruneAt = std::max<std::size_t>(256, spaces.live.size() * 2);
+                    }
+                    spaces.live.emplace_back(built, std::chrono::steady_clock::now());
+                }
                 built->ranges = std::move(ranges);
                 std::vector<Region> extras;
                 for (auto& region : regions) {

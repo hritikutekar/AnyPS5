@@ -447,6 +447,16 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_guest_lease_renewal_tests tests/GuestLeaseRenewal.cpp)
+    target_include_directories(agc_guest_lease_renewal_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_guest_lease_renewal_tests PRIVATE libc)
+    configure_windows_unwind(agc_guest_lease_renewal_tests)
+    add_test(NAME agc_guest_lease_renewal COMMAND agc_guest_lease_renewal_tests)
+    if(WIN32)
+        set_tests_properties(agc_guest_lease_renewal PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_write_watch_coverage_tests tests/WriteWatchCoverage.cpp)
     target_include_directories(agc_write_watch_coverage_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_write_watch_coverage_tests PRIVATE libc)

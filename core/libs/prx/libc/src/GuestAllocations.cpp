@@ -23,6 +23,7 @@
 #include <sstream>
 #include <system_error>
 #include <vector>
+#include <dlfcn.h>
 #include <link.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -39,11 +40,139 @@ struct Registry {
     std::shared_ptr<const Lease::Ranges> readableLease;
     std::shared_ptr<const Lease::Ranges> allLease;
     std::uint64_t backingSerials = 0;
+    // Diagnostic: every lease snapshot made (a lease shares its snapshot, so a range's use count is one
+    // per live snapshot plus direct holders), with when, which kind and who asked; pruned of expired
+    // ones as it grows. A pin wait that does not end lists the live snapshots holding the range.
+    struct Snapshot {
+        std::weak_ptr<const Lease::Ranges> ranges;
+        std::chrono::steady_clock::time_point made;
+        char kind;
+        const void* caller;
+    };
+    std::vector<Snapshot> snapshots;
+    std::size_t pruneAt = 1024;
+    // Spans whose unmap (or removal, or protection to no access) waits for its leases to end: new
+    // lease snapshots leave their ranges out, so builds made meanwhile cannot pin them again (every
+    // address-based build leases every registered range). Safe because the guest releases memory only
+    // after its own GPU work using it completed; nothing recorded later may use it.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> draining;
 };
 
 Registry& registry() {
     static auto* value = new Registry;
     return *value;
+}
+
+// Under the registry lock.
+bool draining(const Range& range) {
+    for (const auto& [begin, end] : registry().draining) {
+        if (range.address < end && begin < range.address + range.bytes) return true;
+    }
+    return false;
+}
+
+// Diagnostic: the registry operation now waiting for its range to be unpinned, and the pin waits
+// that took longer than 1 ms, by operation ([pin-wait] every 10 s).
+thread_local const char* pinOperation = "other";
+thread_local bool pinDrains = false;
+
+struct PinWaitStats {
+    std::uint64_t waits = 0, rounds = 0;
+    double totalMs = 0, maxMs = 0;
+};
+
+void notePinWait(const char* operation, double ms, int rounds) {
+    static std::mutex mutex;
+    static std::map<std::string, PinWaitStats> stats;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    if (ms >= 1.0) {
+        auto& entry = stats[operation];
+        ++entry.waits;
+        entry.rounds += static_cast<std::uint64_t>(rounds);
+        entry.totalMs += ms;
+        entry.maxMs = std::max(entry.maxMs, ms);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10) || stats.empty()) return;
+    last = now;
+    std::string line;
+    for (const auto& [name, entry] : stats) {
+        char text[200];
+        std::snprintf(text, sizeof(text), " %s: %llu waits, %.1f ms (max %.1f ms), %llu rounds;", name.c_str(), static_cast<unsigned long long>(entry.waits), entry.totalMs, entry.maxMs, static_cast<unsigned long long>(entry.rounds));
+        line += text;
+    }
+    std::fprintf(stderr, "[pin-wait] (10 s) waits over 1 ms by operation:%s\n", line.c_str());
+    stats.clear();
+}
+
+thread_local char pinOperationName[64];
+
+struct PinOperation {
+    const char* previous;
+    bool previousDrains;
+    PinOperation(const char* name, bool drains) : previous(pinOperation), previousDrains(pinDrains) {
+        pinOperation = name;
+        pinDrains = drains;
+    }
+    ~PinOperation() {
+        pinOperation = previous;
+        pinDrains = previousDrains;
+    }
+};
+
+// Under the registry lock.
+void noteSnapshot(const std::shared_ptr<const Lease::Ranges>& ranges, char kind, const void* caller) {
+    auto& state = registry();
+    if (state.snapshots.size() >= state.pruneAt) {
+        std::erase_if(state.snapshots, [](const Registry::Snapshot& snapshot) { return snapshot.ranges.expired(); });
+        state.pruneAt = std::max<std::size_t>(1024, state.snapshots.size() * 2);
+    }
+    state.snapshots.push_back({ranges, std::chrono::steady_clock::now(), kind, caller});
+}
+
+std::string callerName(const void* caller) {
+    char text[256];
+#ifndef _WIN32
+    Dl_info info{};
+    if (caller != nullptr && dladdr(caller, &info) != 0 && info.dli_fname != nullptr) {
+        const char* file = std::strrchr(info.dli_fname, '/');
+        file = file != nullptr ? file + 1 : info.dli_fname;
+        if (info.dli_sname != nullptr) std::snprintf(text, sizeof(text), "%s+0x%llx (%s)", info.dli_sname, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(info.dli_saddr)), file);
+        else std::snprintf(text, sizeof(text), "%s+0x%llx", file, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+        return text;
+    }
+#endif
+    std::snprintf(text, sizeof(text), "%p", caller);
+    return text;
+}
+
+// Under the registry lock: who still holds [address, address + bytes): each overlapping range's use
+// count, and every live snapshot containing one (age, kind, lease copies sharing it, who made it).
+void reportPinHolders(std::uintptr_t address, std::size_t bytes, const char* when) {
+    auto& state = registry();
+    const auto end = address + bytes;
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[pin-holders] %s: 0x%llx+0x%llx (%s)\n", when, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pinOperation);
+    auto it = state.ranges.upper_bound(address);
+    if (it != state.ranges.begin()) --it;
+    std::vector<const Range*> pinned;
+    for (; it != state.ranges.end() && (it->first < end || it->first == address); ++it) {
+        const auto& range = it->second;
+        if (!((address < it->first + range->bytes && it->first < end) || it->first == address)) continue;
+        pinned.push_back(range.get());
+        std::fprintf(stderr, "[pin-holders]   range 0x%llx+0x%llx use count %ld (1 is the registry's)\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(range->bytes), range.use_count());
+    }
+    std::size_t live = 0, listed = 0;
+    for (const auto& snapshot : state.snapshots) {
+        const auto ranges = snapshot.ranges.lock();
+        if (ranges == nullptr) continue;
+        ++live;
+        const bool holds = std::any_of(ranges->begin(), ranges->end(), [&](const auto& range) { return std::find(pinned.begin(), pinned.end(), range.get()) != pinned.end(); });
+        if (!holds || ++listed > 24) continue;
+        std::fprintf(stderr, "[pin-holders]   snapshot kind %c, %zu ranges, age %.1f s, %ld lease copies, made by %s%s\n", snapshot.kind, ranges->size(), std::chrono::duration<double>(now - snapshot.made).count(), ranges.use_count() - 1, callerName(snapshot.caller).c_str(), (ranges == state.readableLease || ranges == state.allLease) ? " (the registry's cached one)" : "");
+    }
+    std::fprintf(stderr, "[pin-holders]   %zu live snapshots, %zu hold the range\n", live, listed);
 }
 
 std::uint64_t freshBacking() {
@@ -352,7 +481,10 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     const auto found = state.registeredImages.find(reinterpret_cast<std::uintptr_t>(image));
     if (found == state.registeredImages.end()) return;
     const auto [begin, end] = *found;
-    GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
+    {
+        const PinOperation operation("unregister image", true);
+        GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
+    }
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
     state.registeredImages.erase(found);
@@ -375,7 +507,7 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
     char message[160];
-    std::snprintf(message, sizeof(message), "guest allocation 0x%llx+0x%llx is still pinned by GPU work or an import (%s)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), why);
+    std::snprintf(message, sizeof(message), "guest allocation 0x%llx+0x%llx is still pinned by GPU work or an import (%s; %s)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), pinOperation, why);
     throw std::runtime_error(message);
 }
 
@@ -391,8 +523,38 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     // lock is retaken, since another mutation may have run meanwhile. Without a waiter the lease is
     // dropped by another thread (a synchronous draw or dispatch), so yielding suffices. A waiter
     auto* state = static_cast<MutationState*>(mutation);
-    const auto deadline = std::chrono::steady_clock::now() + pinWait();
+    const auto waitStart = std::chrono::steady_clock::now();
+    const auto deadline = waitStart + pinWait();
     int syncedRounds = 0;
+    int waitRounds = 0;
+    int idleRounds = 0;
+    // APS5_NO_PIN_DRAIN_EXCLUSION=1: builds made during the wait lease the range again, as before.
+    static const bool exclusion = std::getenv("APS5_NO_PIN_DRAIN_EXCLUSION") == nullptr;
+    // APS5_NO_PIN_WAIT_BACKOFF=1: a round that made no progress retries at once, as before. Otherwise
+    // it sleeps 50 us doubling to 2 ms, without the registry lock: back-to-back rounds each took the
+    // driver's GPU mutex in its waiter and starved the committer whose work would end the leases
+    // (best137/202/210: one thread held the mutex ~99 % of the time until the 60 s deadline).
+    static const bool backoff = std::getenv("APS5_NO_PIN_WAIT_BACKOFF") == nullptr;
+    struct Drain {
+        bool active = false;
+        std::pair<std::uint64_t, std::uint64_t> span;
+        ~Drain() {
+            if (!active) return;
+            // Another mutation may have drained its own span meanwhile (the wait releases the lock).
+            auto& spans = registry().draining;
+            if (const auto found = std::find(spans.begin(), spans.end(), span); found != spans.end()) spans.erase(found);
+            registry().readableLease.reset();
+            registry().allLease.reset();
+        }
+    } drain;
+    const auto pause = [&] {
+        if (!backoff) {
+            std::this_thread::yield();
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50 << std::min(idleRounds, 5)));
+        ++idleRounds;
+    };
     for (;;) {
         registry().readableLease.reset();
         registry().allLease.reset();
@@ -409,9 +571,20 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         if (!pinned) {
             if (state != nullptr && bytes != 0) state->unpinned.emplace_back(address, bytes);
+            if (waitRounds != 0) notePinWait(pinOperation, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count(), waitRounds);
             return;
         }
-        if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
+        ++waitRounds;
+        if (exclusion && pinDrains && !drain.active && state != nullptr && state->lock.owns_lock()) {
+            // The caller holds the registry lock here, as it does when the guard pops the span.
+            drain.span = {address, end};
+            registry().draining.push_back(drain.span);
+            drain.active = true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (state != nullptr && state->lock.owns_lock()) reportPinHolders(address, bytes, "giving up");
+            PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
+        }
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;
         if (state != nullptr && state->lock.owns_lock()) {
@@ -419,23 +592,33 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             state->lock.unlock();
             try {
                 if (waiter != nullptr) progressed = waiter(address, bytes);
-                else std::this_thread::yield();
+                if (!progressed) pause();
             } catch (...) {
                 state->lock.lock();
                 throw;
             }
             state->lock.lock();
         } else {
-            std::this_thread::yield();
+            pause();
         }
         if (progressed) {
+            idleRounds = 0;
             // The lease's work finished, yet the range is pinned again: between the waiter's return
             // and the re-lock a driver worker took a new lease (every address-based build pins every
             // registered range). Rare per round, but each round is a GPU wait, so a repeat is reported.
-            if (++syncedRounds == 8) std::fprintf(stderr, "[gpu] leased allocation 0x%llx+0x%llx still pinned after %d recorder syncs\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), syncedRounds);
+            if (++syncedRounds == 8) {
+                std::fprintf(stderr, "[gpu] leased allocation 0x%llx+0x%llx still pinned after %d recorder syncs\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), syncedRounds);
+                if (state != nullptr && state->lock.owns_lock()) reportPinHolders(address, bytes, "after 8 recorder syncs");
+            }
             continue;
         }
     }
+}
+
+void GuestAllocationsRequireUnpinnedAs_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const char* operation, bool drains) {
+    std::snprintf(pinOperationName, sizeof(pinOperationName), "%s", operation != nullptr ? operation : "other");
+    const PinOperation tagged(pinOperationName, drains);
+    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
 }
 
 // The lowest registered range that can touch `address`: the one that starts at or
@@ -543,7 +726,10 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
-    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
+    {
+        const PinOperation operation("remove", true);
+        GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
+    }
     recordChange(mutation, pointer, range.bytes);
     auto& ranges = registry().ranges;
     const auto exact = ranges.find(range.address);
@@ -614,7 +800,10 @@ bool allocationRemains(const Range& range, const RangePatch& patch) {
 }
 
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) {
-    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    {
+        const PinOperation operation(readable || writable ? "protect" : "protect to none", !readable && !writable);
+        GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    }
     recordChange(mutation, pointer, bytes);
     const auto patch = replaceRange(pointer, bytes, false, readable, writable, gpu);
     apply();
@@ -622,7 +811,10 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
 }
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
-    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    {
+        const PinOperation operation("unmap", true);
+        GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    }
     recordChange(mutation, pointer, bytes);
     const auto end = reinterpret_cast<std::uintptr_t>(pointer) + bytes;
     auto cursor = reinterpret_cast<std::uintptr_t>(pointer);
@@ -663,10 +855,12 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     if (auto shared = registry().readableLease) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(registry().ranges.size());
+    const bool drains = !registry().draining.empty();
     for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) ranges->push_back(range);
+        if (range->readable && range->bytes != 0 && !(drains && draining(*range))) ranges->push_back(range);
     }
     registry().readableLease = ranges;
+    noteSnapshot(ranges, 'r', __builtin_return_address(0));
     return Lease(std::move(ranges));
 }
 
@@ -688,9 +882,10 @@ Lease GuestAllocationsAcquireSpans_nid_postfix(const std::vector<std::pair<std::
         if (it != ranges.begin()) --it;
         for (; it != ranges.end() && it->first < end; ++it) {
             const auto& range = it->second;
-            if (range->readable && range->bytes != 0 && range->address + range->bytes > begin && (selected->empty() || selected->back() != range)) selected->push_back(range);
+            if (range->readable && range->bytes != 0 && range->address + range->bytes > begin && (selected->empty() || selected->back() != range) && !draining(*range)) selected->push_back(range);
         }
     }
+    noteSnapshot(selected, 's', __builtin_return_address(0));
     return Lease(std::move(selected));
 }
 
@@ -715,10 +910,12 @@ Lease GuestAllocationsAcquireAll_nid_postfix() {
     if (auto shared = registry().allLease) return Lease(std::move(shared));
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(registry().ranges.size());
+    const bool drains = !registry().draining.empty();
     for (const auto& [address, range] : registry().ranges) {
-        if (range->bytes != 0) ranges->push_back(range);
+        if (range->bytes != 0 && !(drains && draining(*range))) ranges->push_back(range);
     }
     registry().allLease = ranges;
+    noteSnapshot(ranges, 'a', __builtin_return_address(0));
     return Lease(std::move(ranges));
 }
 

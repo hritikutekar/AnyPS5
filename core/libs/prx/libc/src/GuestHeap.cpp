@@ -298,7 +298,7 @@ void GuestHeapFree_nid_postfix(void* pointer) {
     if (pointer == nullptr) return;
     GuestAllocations::Mutation mutation;
     const auto range = mutation.Find(pointer);
-    mutation.RequireUnpinned(pointer, range.bytes);
+    mutation.RequireUnpinnedAs(pointer, range.bytes, "heap free", true);
     free(mutation, pointer);
 }
 
@@ -306,7 +306,7 @@ void* GuestHeapReallocate_nid_postfix(void* pointer, std::size_t bytes) {
     if (pointer == nullptr) return GuestHeapAllocate_nid_postfix(bytes);
     GuestAllocations::Mutation mutation;
     const auto range = mutation.Find(pointer);
-    mutation.RequireUnpinned(pointer, range.bytes);
+    mutation.RequireUnpinnedAs(pointer, range.bytes, "heap realloc", true);
     if (bytes == 0) {
         free(mutation, pointer);
         return nullptr;
@@ -321,7 +321,7 @@ void* GuestHeapRealign_nid_postfix(void* pointer, std::size_t bytes, std::size_t
     if (pointer == nullptr) return GuestHeapAlign_nid_postfix(alignment, bytes);
     GuestAllocations::Mutation mutation;
     const auto range = mutation.Find(pointer);
-    mutation.RequireUnpinned(pointer, range.bytes);
+    mutation.RequireUnpinnedAs(pointer, range.bytes, "heap realign", true);
     if (bytes == 0) {
         free(mutation, pointer);
         return nullptr;

@@ -60,6 +60,10 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept;
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu);
 void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
+// RequireUnpinned for a caller outside the registry's own mutations: `operation` names it in the
+// [pin-wait] and [pin-holders] diagnostics; `drains` when the range becomes unreachable (freed, or no
+// CPU and GPU access), so leases taken during the wait leave it out (see GuestAllocations.cpp).
+void GuestAllocationsRequireUnpinnedAs_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const char* operation, bool drains);
 void GuestAllocationsRequireAvailable_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 bool GuestAllocationsCovers_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 bool GuestAllocationsOverlaps_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
@@ -100,6 +104,7 @@ public:
     void UnregisterImage(const void* image) { GuestAllocationsUnregisterImage_nid_postfix(handle, image); }
     void Add(void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) { GuestAllocationsAdd_nid_postfix(handle, pointer, bytes, readable, writable, gpu); }
     void RequireUnpinned(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireUnpinned_nid_postfix(handle, pointer, bytes); }
+    void RequireUnpinnedAs(const void* pointer, std::size_t bytes, const char* operation, bool drains) const { GuestAllocationsRequireUnpinnedAs_nid_postfix(handle, pointer, bytes, operation, drains); }
     void RequireAvailable(const void* pointer, std::size_t bytes) const { GuestAllocationsRequireAvailable_nid_postfix(handle, pointer, bytes); }
     bool Covers(const void* pointer, std::size_t bytes) const { return GuestAllocationsCovers_nid_postfix(handle, pointer, bytes); }
     bool Overlaps(const void* pointer, std::size_t bytes) const { return GuestAllocationsOverlaps_nid_postfix(handle, pointer, bytes); }
