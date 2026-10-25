@@ -38,7 +38,7 @@ std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const 
 // unchanged; otherwise it builds under the lock as before.
 struct PreparedDraw;
 bool SplitDrawBuild();
-std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {});
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
