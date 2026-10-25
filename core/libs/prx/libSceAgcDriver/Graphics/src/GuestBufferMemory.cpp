@@ -5312,52 +5312,6 @@ void NoteCopyIn(std::uint64_t begin, std::uint64_t end, bool deviceLocal) {
 
 }
 
-namespace {
-
-// Resident shadows (C33, APS5_NO_RESIDENT_SHADOWS=1 off, a runtime switch): a reused build's staged
-// shadow (RecordStagingCopies refills its own buffer, which its descriptors keep bound) skips the
-// copy-in when the shadow still equals the import: its previous use's copy-back stored the whole
-// region, nothing stamped the range since (no CPU store collected, no other GPU writer's MarkWritten),
-// the guest forgot nothing, and this use records on the same lane as that copy-back (whose trailing
-// barrier orders it before this use's work). No buffer is shared between builds.
-struct ResidentCounts {
-    std::mutex mutex;
-    std::uint64_t hits = 0, hitBytes = 0, notKept = 0, stale = 0, otherLane = 0, kept = 0, refusedPartial = 0, refusedStamped = 0;
-    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-};
-
-ResidentCounts& Residents() {
-    static ResidentCounts counts;
-    return counts;
-}
-
-bool ResidentShadowsEnabled() {
-    return !RuntimeSwitches::Set(RuntimeSwitch::NoResidentShadows);
-}
-
-// 0 hit, 1 not kept, 2 stale, 3 other lane, 4 kept, 5 refused partial, 6 refused stamped.
-void NoteResident(int what, std::uint64_t bytes = 0) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
-    auto& r = Residents();
-    std::lock_guard lock(r.mutex);
-    switch (what) {
-        case 0: ++r.hits; r.hitBytes += bytes; break;
-        case 1: ++r.notKept; break;
-        case 2: ++r.stale; break;
-        case 3: ++r.otherLane; break;
-        case 4: ++r.kept; break;
-        case 5: ++r.refusedPartial; break;
-        default: ++r.refusedStamped; break;
-    }
-    if (std::chrono::steady_clock::now() - r.lastReport < std::chrono::seconds(10)) return;
-    r.lastReport = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "[resident-shadows] (10 s) copy-ins skipped (shadow still current) %llu (%.1f MiB); copied: not kept %llu, stale %llu, other lane %llu; kept after a copy-back %llu, refused: partial copy-back %llu, stamped since the copy-in %llu\n", static_cast<unsigned long long>(r.hits), r.hitBytes / 1048576.0, static_cast<unsigned long long>(r.notKept), static_cast<unsigned long long>(r.stale), static_cast<unsigned long long>(r.otherLane), static_cast<unsigned long long>(r.kept), static_cast<unsigned long long>(r.refusedPartial), static_cast<unsigned long long>(r.refusedStamped));
-    r.hits = r.hitBytes = r.notKept = r.stale = r.otherLane = r.kept = r.refusedPartial = r.refusedStamped = 0;
-}
-
-}
-
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
@@ -5408,27 +5362,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
         if (GpuAttribution()) NoteCopyIn(region->begin, region->end, region->deviceLocal);
-        region->residentHit = false;
-        region->residentCandidate = false;
-        if (region->deviceLocal && ResidentShadowsEnabled()) {
-            const int lane = Recorder::ThreadLane();
-            if (region->buffer != nullptr && region->residentKept) {
-                if (region->residentLane != lane) NoteResident(3);
-                else if (region->residentForget == GuestMemory::ForgetSerial() && GuestMemory::UnchangedSinceCollected(region->begin, static_cast<std::size_t>(bytes), region->residentKeptGeneration)) {
-                    region->residentHit = true;
-                    NoteResident(0, bytes);
-                } else NoteResident(2);
-            } else if (region->buffer != nullptr) {
-                NoteResident(1);
-            }
-            region->residentKept = false;
-            region->residentGeneration = GuestMemory::TrackerGeneration();
-            region->residentForget = GuestMemory::ForgetSerial();
-            region->residentLane = lane;
-        } else {
-            region->residentKept = false;
-            region->residentLane = -1;
-        }
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -5466,11 +5399,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        // A kept shadow already holds the range's bytes (C33): no copy, no read of the import.
-        if (!region->residentHit) {
-            Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
-            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        }
+        Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
+        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -5487,7 +5417,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr && !region->residentHit) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
@@ -5650,20 +5580,6 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
-        // C33: the shadow equals the import after this copy-back when it stored the whole region and
-        // nothing stamped the range since the copy-in; MarkDirectWrites then keeps it.
-        if (region.deviceLocal && region.residentLane >= 0 && ResidentShadowsEnabled()) {
-            auto covered = region.begin;
-            for (const auto& [begin, end] : merged) {
-                if (end <= covered) continue;
-                if (begin > covered) break;
-                covered = std::max(covered, end);
-                if (covered >= region.end) break;
-            }
-            if (covered < region.end) NoteResident(5);
-            else if (region.residentForget != GuestMemory::ForgetSerial() || !GuestMemory::UnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), region.residentGeneration)) NoteResident(6);
-            else region.residentCandidate = true;
-        }
     }
     if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -6187,14 +6103,6 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
-    }
-    // C33: a shadow whose copy-back stored its whole region equals the import as of this use's marks.
-    for (const auto& region : regions) {
-        if (!region.residentCandidate) continue;
-        region.residentCandidate = false;
-        region.residentKept = true;
-        region.residentKeptGeneration = GuestMemory::TrackerGeneration();
-        NoteResident(4);
     }
 }
 

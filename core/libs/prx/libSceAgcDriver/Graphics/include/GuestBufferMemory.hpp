@@ -501,19 +501,6 @@ private:
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
         // of the import (AddressRanges). APS5_NO_BDA_STAGING=1 serves it from the import as before.
         bool overlay = false;
-        // Resident shadows (APS5_NO_RESIDENT_SHADOWS=1 off, see GuestBufferMemory.cpp): this use's
-        // copy-in kept the shadow's bytes from the build's previous use instead of copying; the tracker
-        // generation, forget serial and recorder lane at the copy-in; `residentCandidate` set by
-        // RecordCopyBacks when the copy-back stored the whole region with nothing stamped over it since
-        // the copy-in; `residentKept` and its generation set by MarkDirectWrites after this use's marks:
-        // the shadow equals the import as of that generation.
-        bool residentHit = false;
-        std::uint64_t residentGeneration = 0;
-        std::uint64_t residentForget = 0;
-        int residentLane = -1;
-        mutable bool residentCandidate = false;
-        mutable bool residentKept = false;
-        mutable std::uint64_t residentKeptGeneration = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
