@@ -7,16 +7,16 @@
 > A work-in-progress test branch, not upstream code: `yotei/best` (Windows) plus the fixes it needs on Linux/RADV,
 > a Mesa patch, and diagnostics. Nothing here has been reviewed upstream.
 
-## Where it stands (2026-10-23)
+## Where it stands (2026-10-25)
 
 | | |
 |---|---|
 | **Furthest point** | Open world (loads from the title screen's Continue) |
-| **Frame rate** | open world about **1.13 fps** at the village gate (11.34 presents per 10 s, run best155), with the 1080p game patch below; was about 0.7 fps on 2026-10-20, 0.9 fps on 2026-10-22 and 1.0 fps on the morning of 2026-10-23 |
+| **Frame rate** | open world about **1.6 fps** at the village gate: 16.2 presents per 10 s without the driver's profiling (run best191), 15.7 with it over 20 minutes (best189), on `da11e77de` with the environment below and the 1080p game patch; was about 0.7 fps on 2026-10-20, 1.13 fps on 2026-10-23 and 1.3 fps on 2026-10-24 |
 | **Base** | Celegans12's `yotei/best` 233fff3f6 (upstream `main` 2026-10-21, draw-ahead #6188 off by default) |
 | **Needs** | Mesa 26.2.4 with [our ACO patch](docs/yotei-linux/mesa-26.2.4-aco-spill-fixes.patch); without it the GPU faults while the world loads |
 | **Tested on** | CachyOS, kernel 7.2.9, AMD RX 9070 XT (RDNA4, gfx1201), RADV, 32 GB RAM + swap, GCC, Release |
-| **First boot** | long: every shader compiles cold (AnyPS5 translation and Mesa); later boots use both caches |
+| **First boot** | long: every shader compiles cold (AnyPS5 translation and Mesa); later boots use both caches. The recompiler changes of 2026-10-24 start a new AnyPS5 shader cache (about 11 minutes to the menu here, cold) |
 
 ## The world-load GPU fault was a Mesa ACO bug
 
@@ -76,6 +76,26 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
     skipped from a memo instead of serializing a 54–64 KB request each (`APS5_NO_REFUSAL_MEMO=1` off), and
     `ShaderMemory::collect` merges through a heap (`APS5_NO_COLLECT_HEAP=1` off): **+6.2 %** together (each alone
     +2.6, +2.5, +2.4 and +1.2 %; the last not significant, its output verified identical).
+- Performance, 2026-10-24/25 (each measured with an in-run A/B unless noted; zero faults, rendering unchanged in frame
+  dumps of both phases):
+  - Runtime-format buffer loads (the generic decoder the six giant compute programs call 112–128 times each, which
+    RADV inlines) convert components in one straight line and read their element in one span: the giants run up to
+    60 % fewer GPU instructions, GPU time per frame 482 -> 431 ms, world 12.0 -> 13.0 presents per 10 s
+    (`d8a50e449`, `05b662722`; recompiler, so a new shader cache; `APS5_NO_COMPACT_FORMAT_CONVERT=1`,
+    `APS5_NO_SINGLE_FORMAT_READ=1` off).
+  - Ring 0x51's single-workgroup programs (0x80001c0300 and family, one CU per dispatch, ~76 ms a frame) overlap as the
+    title allows: a dispatch joining a run reads in place what the run already accesses instead of a private staged
+    copy, which made the staged-read guard refuse every join (`8106f78f5`): **+2.0 %**, confirmed **+2.6 %**;
+    0x80001c0300's GPU time -58 % (`APS5_NO_RUN_IN_PLACE=1` off).
+  - Queue 0's dispatches go to the draw committer as items instead of draining it (MT1a); the two switches are runtime
+    switches now (`da11e77de`): **+2.4 %** with `APS5_PIPELINE_DISPATCH=1 APS5_PIPELINE_DISPATCH_MISSES=1` (opt-in).
+  - BDA programs' dispatch items count their descriptor writes as their writes, as draws do and as the inline path
+    notes them, so most cached dispatches no longer drain (`da11e77de`): **+1.7 %** with
+    `APS5_DISPATCH_ITEM_BDA_WRITES=1` (opt-in).
+  - jemalloc instead of glibc malloc (`LD_PRELOAD=/usr/lib/libjemalloc.so.2`): **+14.5 %** (15.00 vs 13.10 presents per
+    10 s, restart legs best179/best181 vs best180). The comparison was against glibc with
+    `GLIBC_TUNABLES=glibc.malloc.arena_max=4:glibc.malloc.mmap_threshold=131072`, under which ~10 % of queue 0's worker
+    sat in malloc's slow path; against glibc's defaults the gain may be smaller (not measured).
 - The second Vulkan queue (`APS5_ASYNC_LANE=51`) runs on RADV's compute family (RADV's graphics family has one queue).
 - Texture-cache frame age counts seconds only once presents stand still for 10 s (`APS5_NO_PRESENT_FRAME_AGE=1` off).
 - Driver threads are named on Linux (`agc q0x0`, `agc commit`, …) for `top -H` and `perf`.
@@ -83,7 +103,8 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 - Diagnostics: `[import-retire]`, `[storage-refresh]`, `[flush-wait]`, `[bad-bda]`, `APS5_BUFFER_VA_HISTORY=1`,
   `APS5_SKIP_SHADER=<address,...>`; under `APS5_PROFILE_DRAW` also `[invocation-for]`, `[depth-surfaces]`, the
   `[bufferpool]` evictions by cause and the `[draw] pipelined` write-scan sample; `APS5_VERIFY_COLLECT_HEAP=1` and
-  `APS5_VERIFY_BDA_INCREMENTAL=1` check the new paths against the old ones.
+  `APS5_VERIFY_BDA_INCREMENTAL=1` check the new paths against the old ones; `APS5_DUMP_QUEUE=<queue>` with
+  `APS5_DUMP_QUEUE_SKIP=<n>` dumps a queue's packets after its first n submissions.
 
 ## Run it on Linux
 
@@ -101,10 +122,14 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
    APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
    APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200 APS5_NO_PRECISE_SMALL_OVERLAP=1
    APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_STAGING_POOL_MIB=512
+   APS5_PIPELINE_DISPATCH=1 APS5_PIPELINE_DISPATCH_MISSES=1 APS5_DISPATCH_ITEM_BDA_WRITES=1
+   LD_PRELOAD=/usr/lib/libjemalloc.so.2
    ```
    `APS5_RESOURCE_CACHE_ENTRIES=1024` matters: without it the resource cache's adaptive capacity often grows to 4096 in
    the world load, keeps ~2.3 GiB more staging in VRAM and the world runs at about a third of the speed.
    `APS5_NO_PRECISE_SMALL_OVERLAP=1` keeps the world's colours right (white hair and bleached wood without it).
+   jemalloc comes with most distributions (`jemalloc` package); the path may differ. Over a 27-minute run with it the
+   process memory in the world stayed flat (about 3 GB resident; the peak, ~23 GB, is during the world load).
 4. Optional, +13 % in the world here: shahulmubeen-a's 1080p relinker patch for 02.002.000 (output 3840x2160 ->
    1920x1080 and the dynamic-resolution table pinned to 1080p), from
    [#675](https://github.com/boykopovar/AnyPS5/discussions/675#discussioncomment-19114360).
@@ -113,10 +138,10 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 
 ## Known issues
 
-- About 1.1 fps in the open world: per frame about 0.5 s of GPU work, the rest the CPU side. Queue 0's packet worker and
-  the draw committer use about one core together (they take turns), so their per-draw work sets the frame time. The
-  committer holds the GPU mutex for each draw it records (~90 us), and the worker drains it before most compute
-  dispatches, whose BDA writes aren't known in advance.
+- About 1.6 fps in the open world: per frame (~640 ms) about 330 ms of GPU work; the rest waits on the CPU side. The draw
+  committer now records both the draws and queue 0's dispatches and is ~72 % busy; it also waits ~1.1 s per 10 s for the
+  GPU mutex behind the compute queues' dispatches. Address-based (BDA) draws, ~27 % of its work, are built on it because
+  the preparer thread can't map address tables yet; that is the next step.
 - One run crashed at boot on a zero dword in the title's command buffer ("unsupported PM4 packet type"); the cause is
   unknown and it hasn't happened again in the runs since.
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
