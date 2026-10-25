@@ -1637,6 +1637,14 @@ struct ResourceUse {
     }
 };
 
+// The [gputime] key of a draw's pass: the draw class, or under APS5_PROFILE_GPU_ATTRIB=1 (diagnostic)
+// the program recording it (Recorder::CurrentWriteOrigin) with bit 62 set, so passes rank by program.
+std::uint64_t DrawTimingKey() {
+    static const bool byProgram = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
+    if (!byProgram) return Recorder::ClassKey(Recorder::CommandClass::Draw);
+    return Recorder::CurrentWriteOrigin() | (1ull << 62);
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -2288,7 +2296,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
-    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto drawTiming = !continued ? recorder->BeginGpuTiming(DrawTimingKey()) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2944,7 +2952,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
-    const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto drawTiming = recorded ? recorder->BeginGpuTiming(DrawTimingKey()) : Recorder::NoTiming;
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
