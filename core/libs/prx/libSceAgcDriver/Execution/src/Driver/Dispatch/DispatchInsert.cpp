@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -125,7 +126,8 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             }
 
             static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
-            const auto over = [&] { return dispatchCache.size() > dispatchCacheEntries() || (dispatchCache.size() > 1 && dispatchCacheVariantBytes > DispatchCacheBytes()); };
+            const auto entriesCap = dispatchCacheEntryCap();
+            const auto over = [&] { return dispatchCache.size() > entriesCap || (dispatchCache.size() > 1 && dispatchCacheVariantBytes > DispatchCacheBytes()); };
             if (over()) {
                 if (lru) {
                     while (over()) {

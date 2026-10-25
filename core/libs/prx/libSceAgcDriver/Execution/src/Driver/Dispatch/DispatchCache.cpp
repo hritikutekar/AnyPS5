@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <cstdlib>
@@ -43,6 +44,17 @@ std::size_t Driver::dispatchCacheEntries() {
         return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
     }();
     return entries;
+}
+
+std::size_t Driver::dispatchCacheEntryCap() {
+    // The dispatch cache holds 2,048 entries unless APS5_DISPATCH_CACHE_ENTRIES sets the count: in the
+    // world nearly every dispatch's data changes each frame, so validating more cached variants cost
+    // more than their rare hits saved (in-run A/Bs: 4,096 +1.7 % over 8,192, best243; 2,048 +0.7 % over
+    // 4,096, best244; 32,768 -1.5 %, best242). APS5_NO_SMALL_DISPATCH_CACHE=1 (runtime switch) keeps the
+    // default count (8,192 or 16,384).
+    static const bool configured = std::getenv("APS5_DISPATCH_CACHE_ENTRIES") != nullptr;
+    if (configured || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSmallDispatchCache)) return dispatchCacheEntries();
+    return std::min<std::size_t>(dispatchCacheEntries(), 2048);
 }
 
 std::uint64_t Driver::DispatchCacheBytes() {
