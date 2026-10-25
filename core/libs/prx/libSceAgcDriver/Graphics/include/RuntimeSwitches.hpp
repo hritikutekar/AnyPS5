@@ -67,6 +67,7 @@ enum class RuntimeSwitch : std::size_t {
     DispatchItemBdaWrites,
     NoPreparedDispatchItems,
     NoBdaDrawSplit,
+    NoBdaDispatchSplit,
     Count,
 };
 
