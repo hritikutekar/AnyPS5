@@ -2,6 +2,9 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
 #include <algorithm>
+#include <string>
+#include <map>
+#include <source_location>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -51,14 +54,14 @@ public:
     static std::size_t Depth();
     static std::size_t QueuedItems();
     static bool PipelineIndirect();
-    static bool DrainBeforeRead(std::uint64_t address, std::size_t bytes);
+    static bool DrainBeforeRead(std::uint64_t address, std::size_t bytes, std::source_location where = std::source_location::current());
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {});
-    void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current());
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     // DMA_DATA as pipeline items, and SET_PREDICATION, NOP sub-ops and non-overlapping DMA_DATA kept
@@ -68,14 +71,14 @@ public:
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
-    bool DrainIfOverlaps(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100) {
-        return DrainIfOverlaps(ranges, [](const Range& range) { return range; }, reason, opcode);
+    bool DrainIfOverlaps(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current()) {
+        return DrainIfOverlaps(ranges, [](const Range& range) { return range; }, reason, opcode, where);
     }
     template<typename TRanges, typename TBounds>
-    bool DrainIfOverlaps(const TRanges& ranges, TBounds&& bounds, DrainReason reason, std::uint32_t opcode = 0x100) {
+    bool DrainIfOverlaps(const TRanges& ranges, TBounds&& bounds, DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current()) {
         if (!Busy()) return false;
         if (!pendingWrites(ranges, bounds)) return false;
-        Drain(reason, opcode);
+        Drain(reason, opcode, where);
         return true;
     }
     void Note(Event event) { events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed); }
@@ -169,6 +172,8 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
+    // Diagnostic: drains other than packet drains by the call site that asked for them (file:line).
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drainSites;
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::int64_t lastPopNs = 0;

@@ -149,11 +149,11 @@ bool DrawPipeline::PipelineIndirect() {
     return enabled;
 }
 
-bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes) {
+bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes, std::source_location where) {
     if (!Active()) return false;
     auto& pipeline = Queue0();
     if (!pipeline.Busy() || !pipeline.Overlaps(address, bytes)) return false;
-    pipeline.Drain(DrainReason::Capture);
+    pipeline.Drain(DrainReason::Capture, 0x100, where);
     return true;
 }
 
@@ -265,6 +265,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         *top = 0;
     }
     drainOpcodes = {};
+    if (!drainSites.empty()) {
+        drainText += "; drains by site:";
+        for (const auto& [name, site] : drainSites) {
+            char item[160];
+            std::snprintf(item, sizeof(item), " %s x%llu (%.1f ms)", name.c_str(), static_cast<unsigned long long>(site.first), static_cast<double>(site.second) / 1e6);
+            drainText += item;
+        }
+        drainSites.clear();
+    }
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
@@ -405,7 +414,7 @@ void DrawPipeline::Stop() {
     else committer.join();
 }
 
-void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, std::source_location where) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
@@ -418,7 +427,15 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    const auto waitedNs = elapsedNs(start);
+    drainWaitNs[index] += waitedNs;
+    {
+        const char* file = where.file_name();
+        if (const char* slash = std::strrchr(file, '/')) file = slash + 1;
+        auto& site = drainSites[std::string(DrainNames[index]) + "@" + file + ":" + std::to_string(where.line())];
+        ++site.first;
+        site.second += waitedNs;
+    }
     ++drainWaits;
     drainWakeNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, nowNs() - lastPopNs));
     traceWait("DrawPipeline.drain", DrainNames[index], start);

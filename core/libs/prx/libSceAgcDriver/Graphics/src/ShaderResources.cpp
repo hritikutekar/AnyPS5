@@ -1698,8 +1698,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.blockGuard = untrackedGuard(address, bytes);
             entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
+        static const bool profileSnapshots = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        const auto snapshotStart = std::chrono::steady_clock::now();
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
+        const auto readDone = std::chrono::steady_clock::now();
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -1709,6 +1712,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, spill);
+        const auto textureDone = std::chrono::steady_clock::now();
         ++cache.counts.made;
         ++cache.totals.made;
         cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
@@ -1724,6 +1728,40 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+        if (profileSnapshots) {
+            // Diagnostic: snapshots taking over 1 ms, by surface, every 10 s ([snapshots]).
+            const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+            const auto now = std::chrono::steady_clock::now();
+            const auto total = ms(snapshotStart, now);
+            struct Slow { std::uint64_t count = 0; double total = 0, read = 0, made = 0, hash = 0; std::size_t bytes = 0; std::string shape; };
+            static std::mutex slowMutex;
+            static std::map<std::uint64_t, Slow> slow;
+            static auto reported = std::chrono::steady_clock::now();
+            std::lock_guard slowLock(slowMutex);
+            if (total >= 1.0) {
+                auto& entrySlow = slow[address];
+                ++entrySlow.count;
+                entrySlow.total += total;
+                entrySlow.read += ms(snapshotStart, readDone);
+                entrySlow.made += ms(readDone, textureDone);
+                entrySlow.hash += ms(textureDone, now);
+                entrySlow.bytes = bytes;
+                char shape[96];
+                std::snprintf(shape, sizeof(shape), "%ux%u mips %u fmt %u tile %d keys %d", resource.width, resource.height, resource.mipCount, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(*keys));
+                entrySlow.shape = shape;
+            }
+            if (now - reported >= std::chrono::seconds(10) && !slow.empty()) {
+                reported = now;
+                std::string line;
+                for (const auto& [at, entrySlow] : slow) {
+                    char item[256];
+                    std::snprintf(item, sizeof(item), "\n  0x%llx %s %.1f MiB: %llu x %.1f ms (read %.1f, texture %.1f, hash %.1f)", static_cast<unsigned long long>(at), entrySlow.shape.c_str(), entrySlow.bytes / 1048576.0, static_cast<unsigned long long>(entrySlow.count), entrySlow.total / static_cast<double>(entrySlow.count), entrySlow.read / static_cast<double>(entrySlow.count), entrySlow.made / static_cast<double>(entrySlow.count), entrySlow.hash / static_cast<double>(entrySlow.count));
+                    line += item;
+                }
+                std::fprintf(stderr, "[snapshots] (10 s) sampled snapshots over 1 ms by surface:%s\n", line.c_str());
+                slow.clear();
+            }
+        }
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
