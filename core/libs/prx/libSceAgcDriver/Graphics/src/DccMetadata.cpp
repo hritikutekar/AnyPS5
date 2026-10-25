@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -683,7 +684,21 @@ bool FillDccClear(VkFormat format, DccKeys keys, bool alphaOnMsb, std::span<std:
             if (((value >> i) & 1u) != 0) element[bit / 8u] |= static_cast<std::byte>(1u << (bit % 8u));
         }
     }
-    for (std::size_t offset = 0; offset + element.size() <= bytes.size(); offset += element.size()) std::memcpy(bytes.data() + offset, element.data(), element.size());
+    // The whole elements only (a trailing partial element stays as it was). One memcpy per element
+    // cost ~7 ms for a 1-byte-element 1080p surface snapshotted every frame (best240); the filled
+    // prefix doubles instead. APS5_NO_FAST_DCC_FILL=1 (runtime switch) copies element by element.
+    const auto filled = bytes.size() / element.size() * element.size();
+    if (filled == 0) return true;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoFastDccFill)) {
+        for (std::size_t offset = 0; offset + element.size() <= bytes.size(); offset += element.size()) std::memcpy(bytes.data() + offset, element.data(), element.size());
+        return true;
+    }
+    std::memcpy(bytes.data(), element.data(), element.size());
+    for (std::size_t done = element.size(); done < filled;) {
+        const auto chunk = std::min(done, filled - done);
+        std::memcpy(bytes.data() + done, bytes.data(), chunk);
+        done += chunk;
+    }
     return true;
 }
 
