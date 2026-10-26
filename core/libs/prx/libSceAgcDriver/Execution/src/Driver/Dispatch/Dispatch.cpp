@@ -235,7 +235,13 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            static const bool q30Profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            const bool q30 = q30Profile && submission.queue == 0x30;
+            const auto drainStart = q30 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (q30) NoteQueue30Prologue(indirectArguments != 0, Queue30Step::Drain, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drainStart).count());
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             if (pipelineCandidate && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];

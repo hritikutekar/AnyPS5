@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
+#include <mutex>
 
 namespace AgcDriver::DriverDetail {
 
@@ -29,6 +30,26 @@ void Driver::addDriverPhases(DispatchClass which, const std::array<double, Drive
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] driver phases %s (10 s, %llu dispatches, %llu cache hits), us per dispatch:%s, total %.1f (%.1f ms); validate %.1f us per validation (%llu validations; GPU waits inside it %.1f us per validation apart)\n", DispatchClassNames[cls], static_cast<unsigned long long>(line.dispatches), static_cast<unsigned long long>(line.hits), report.c_str(), total * 1000 / static_cast<double>(line.dispatches), total, line.ms[PhaseValidate] * perValidation, static_cast<unsigned long long>(line.validations), line.ms[PhaseValidateWait] * perValidation);
         line = {};
     }
+}
+
+// Diagnostic (APS5_PROFILE_DRAW): queue 0x30's dispatch prologue (the time before the dispatch's own phases) by
+// step: landing pending waits, resolving the group ahead, draining queue 0's draw pipeline; [q30-prologue].
+void NoteQueue30Prologue(bool indirect, Queue30Step step, double ms) {
+    static std::mutex mutex;
+    static double totals[2][3] = {};
+    static std::uint64_t counts[2][3] = {};
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    totals[indirect][static_cast<std::size_t>(step)] += ms;
+    ++counts[indirect][static_cast<std::size_t>(step)];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[q30-prologue] (10 s) direct: land %llu %.0f ms, ahead %llu %.0f ms, drain %llu %.0f ms; indirect: land %llu %.0f ms, ahead %llu %.0f ms, drain %llu %.0f ms\n",
+        static_cast<unsigned long long>(counts[0][0]), totals[0][0], static_cast<unsigned long long>(counts[0][1]), totals[0][1], static_cast<unsigned long long>(counts[0][2]), totals[0][2],
+        static_cast<unsigned long long>(counts[1][0]), totals[1][0], static_cast<unsigned long long>(counts[1][1]), totals[1][1], static_cast<unsigned long long>(counts[1][2]), totals[1][2]);
+    for (auto& row : totals) for (auto& value : row) value = 0;
+    for (auto& row : counts) for (auto& value : row) value = 0;
 }
 
 PendingDispatchPhases& Driver::pendingDispatchPhases() {

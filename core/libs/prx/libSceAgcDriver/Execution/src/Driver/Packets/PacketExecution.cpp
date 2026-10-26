@@ -480,7 +480,7 @@ void Driver::execute(const Submission& submission) {
             auto& pending = pendingDispatchPhases();
             if (pending.phases) {
                 pending.ms[PhaseEpilogue] = std::chrono::duration<double, std::milli>(now - pending.tailAt).count();
-                addDriverPhases(submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct, pending.ms, pending.hit, pending.validated);
+                addDriverPhases(submission.queue == 0x30 ? (indirect ? Queue30Indirect : Queue30Direct) : submission.queue != 0 ? OtherQueues : indirect ? Queue0Indirect : Queue0Direct, pending.ms, pending.hit, pending.validated);
             }
             if (indirect) return;
             auto& row = packetProfile.dispatchOutcomes[static_cast<std::size_t>(pending.outcome)];
@@ -578,14 +578,19 @@ void Driver::execute(const Submission& submission) {
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
+            const bool q30Prologue = profilePackets && submission.queue == 0x30;
+            const auto landStart = q30Prologue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             landPendingWaits(submission.queue);
+            if (q30Prologue) NoteQueue30Prologue(opcode == 0x16, Queue30Step::Land, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - landStart).count());
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
                 static const bool gateDrain = std::getenv("APS5_PIPELINE_DISPATCH_GATE_DRAIN") != nullptr;
                 if (!pipelineDispatch() || submission.queue != 0 || gateDrain) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    const auto aheadStart = q30Prologue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
+                    if (q30Prologue) NoteQueue30Prologue(opcode == 0x16, Queue30Step::Ahead, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - aheadStart).count());
                 }
             }
             if (ringOverlap) Graphics::Recorder::SetDispatchOrder(submission.queue + 1u, ringOrder.afterDispatch);

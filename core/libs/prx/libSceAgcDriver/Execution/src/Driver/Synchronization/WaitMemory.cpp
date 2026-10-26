@@ -7,9 +7,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <chrono>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -156,6 +159,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint64_t refusedGeneration = 0;
 
     bool behindCompletion = false;
+    std::uint32_t labelQueue = 0xffffffffu;
     const auto traceLate = [&](const char* outcome, const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal) {
         static std::atomic<int> shown{0};
         if (shown.fetch_add(1) >= 200) return;
@@ -180,6 +184,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             ++outcomes.fromRecorderLate;
             if (trace) traceLate("trusted", hit, refusal);
         }
+        labelQueue = hit->queue;
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         // Answered from the label table before the store ran on the GPU: with the async compute lane,
@@ -331,6 +336,46 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::uint32_t queue;
         ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
+    // Diagnostic (APS5_PROFILE_DRAW): blocked waits of 0.5 ms or more by waiting queue, how they ended and which
+    // queue produced the value (the label table's or a recorded store's queue, else the newest packet write of the
+    // address in the write history), printed every 10 s as [q-wait].
+    enum class WaitEnd : std::size_t { Memory, Store, Label, Settled, Count };
+    struct Q0WaitNote {
+        bool enabled;
+        std::uint32_t queue;
+        std::chrono::steady_clock::time_point begin;
+        WaitEnd end = WaitEnd::Memory;
+        std::uint32_t producer = 0xffffffffu;
+        ~Q0WaitNote() {
+            if (!enabled) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            if (ms < 0.5) return;
+            struct Bucket { std::uint64_t count = 0; double ms = 0.0, maxMs = 0.0; };
+            static std::mutex mutex;
+            static std::map<std::tuple<std::uint32_t, std::size_t, std::uint32_t>, Bucket> buckets;
+            static auto last = std::chrono::steady_clock::now();
+            std::lock_guard lock(mutex);
+            auto& bucket = buckets[{queue, static_cast<std::size_t>(end), producer}];
+            ++bucket.count;
+            bucket.ms += ms;
+            bucket.maxMs = std::max(bucket.maxMs, ms);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::seconds(10)) return;
+            last = now;
+            static constexpr const char* names[] = {"memory", "store", "label", "settled"};
+            std::string line = "[q-wait] (10 s) blocked waits >= 0.5 ms, waiting queue <- end/producer queue:";
+            for (const auto& [key, value] : buckets) {
+                const auto& [waiter, how, from] = key;
+                char item[128];
+                std::snprintf(item, sizeof(item), " 0x%x<-%s/0x%x %llu %.0fms max %.1f", waiter, names[how], from == 0xffffffffu ? 0xffu : from, static_cast<unsigned long long>(value.count), value.ms, value.maxMs);
+                line += item;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+            buckets.clear();
+        }
+    };
+    static const bool q0WaitProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    Q0WaitNote q0Wait{q0WaitProfile, queue, std::chrono::steady_clock::now()};
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
@@ -340,6 +385,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+            q0Wait.end = WaitEnd::Store;
+            q0Wait.producer = writer;
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
             return;
@@ -355,13 +402,20 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::this_thread::yield();
         }
         CheckFailure();
-        if (pollService(!spinning)) return;
+        if (pollService(!spinning)) {
+            q0Wait.end = WaitEnd::Label;
+            q0Wait.producer = labelQueue;
+            return;
+        }
         if (storeHeldResults && !spinning && (polls & 31u) == 0) GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    q0Wait.end = WaitEnd::Settled;
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -405,6 +459,17 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                              static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
             }
             context.Print(stderr, "[gpu]   preceding packet %s\n");
+        }
+    }
+    if (q0Wait.enabled) {
+        const auto& history = writeHistory();
+        const auto cursor = writeCursor();
+        for (std::size_t back = 1; back <= history.size(); ++back) {
+            const auto& record = history[(cursor - back) % history.size()];
+            if (record.length != 0 && record.target <= awaited && awaited < record.target + std::max<std::uint64_t>(record.length, 4)) {
+                q0Wait.producer = record.queue;
+                break;
+            }
         }
     }
     ++outcomes.polled;

@@ -11,13 +11,16 @@ namespace AgcDriver::DriverDetail {
 
 enum DriverPhase { PhasePrologue, PhaseKey, PhaseLookup, PhaseValidate, PhaseValidateWait, PhaseRelock, PhaseCapture, PhaseRecompile, PhaseInsert, PhaseQueuedLabels, PhaseSnapshots, PhasePrepareKey, PhasePrepareFind, PhasePreparePrecollect, PhasePreparePresync, PhasePrepareStageA, PhasePrepareOther, PhaseRecipePrecheck, PhaseLockWait, PhaseLabels, PhaseNoteWriters, PhaseDevice, PhaseTail, PhaseEpilogue, DriverPhaseCount };
 
-enum DispatchClass : std::size_t { Queue0Direct, Queue0Indirect, OtherQueues, DispatchClassCount };
+enum DispatchClass : std::size_t { Queue0Direct, Queue0Indirect, Queue30Direct, Queue30Indirect, OtherQueues, DispatchClassCount };
+
+enum class Queue30Step : std::size_t { Land, Ahead, Drain };
+void NoteQueue30Prologue(bool indirect, Queue30Step step, double ms);
 
 enum class DispatchOutcome : std::size_t { Skipped = 0, Real, CopyHle, FillHle, SkippedMemo, Count };
 
 inline constexpr const char* DriverPhaseNames[DriverPhaseCount] = {"prologue", "key", "lookup", "validate", "validate GPU wait", "relock", "capture", "recompile", "insert", "queued-label check", "snapshots", "prepare: key", "prepare: find", "prepare: precollect", "prepare: presync", "prepare: stage A (miss)", "prepare: other", "recipe pre-check", "lock wait", "labels", "note writers", "device call", "tail", "epilogue"};
 
-inline constexpr const char* DispatchClassNames[DispatchClassCount] = {"queue 0 direct", "queue 0 indirect", "other queues"};
+inline constexpr const char* DispatchClassNames[DispatchClassCount] = {"queue 0 direct", "queue 0 indirect", "queue 0x30 direct", "queue 0x30 indirect", "other queues"};
 
 inline constexpr const char* DispatchOutcomeNames[static_cast<std::size_t>(DispatchOutcome::Count)] = {"skipped", "real", "copy HLE", "fill HLE", "skipped (memo)"};
 
