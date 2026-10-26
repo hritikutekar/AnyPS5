@@ -268,6 +268,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/Submission.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/SubmissionRing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/WorkerAffinity.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/ProfileGuided.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderRegistry.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
@@ -417,6 +418,19 @@ set(ANYPS5_AGC_MARCH "native" CACHE STRING "-march value for ANYPS5_AGC_NATIVE")
 if(ANYPS5_AGC_NATIVE)
     target_compile_options(libSceAgcDriver PRIVATE -march=${ANYPS5_AGC_MARCH} -ffp-contract=off -fno-semantic-interposition)
     set_property(TARGET libSceAgcDriver PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+# ANYPS5_AGC_PGO=generate|use (opt-in, GCC): profile-guided optimization of the driver library. "generate" builds
+# it instrumented; APS5_PGO_DUMP_AT=<present> (default 2600) writes the profile into ANYPS5_AGC_PGO_DIR at that
+# present of queue 0 (NotePgoPresent), since the game is usually stopped from outside. "use" builds with that
+# profile; a function changed since the training run builds without it (a coverage-mismatch warning).
+set(ANYPS5_AGC_PGO "" CACHE STRING "Profile-guided optimization of libSceAgcDriver: generate, use or empty")
+set(ANYPS5_AGC_PGO_DIR "${CMAKE_BINARY_DIR}/agc-pgo" CACHE PATH "Profile directory for ANYPS5_AGC_PGO")
+if(ANYPS5_AGC_PGO STREQUAL "generate")
+    target_compile_options(libSceAgcDriver PRIVATE -fprofile-generate=${ANYPS5_AGC_PGO_DIR} -fprofile-update=prefer-atomic)
+    target_link_options(libSceAgcDriver PRIVATE -fprofile-generate=${ANYPS5_AGC_PGO_DIR} -fprofile-update=prefer-atomic LINKER:-u,__gcov_dump)
+elseif(ANYPS5_AGC_PGO STREQUAL "use")
+    target_compile_options(libSceAgcDriver PRIVATE -fprofile-use=${ANYPS5_AGC_PGO_DIR} -fprofile-correction -fprofile-partial-training -Wno-missing-profile -Wno-error=coverage-mismatch)
+    target_link_options(libSceAgcDriver PRIVATE -fprofile-use=${ANYPS5_AGC_PGO_DIR} -fprofile-correction -fprofile-partial-training)
 endif()
 
 if(BUILD_TESTING)
