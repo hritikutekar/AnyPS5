@@ -408,6 +408,16 @@ if(APS5_ENABLE_TRACY)
     target_link_libraries(libSceAgcDriver PUBLIC TracyClient)
 endif()
 target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-libs,$<TARGET_FILE_NAME:decoder_png>)
+# ANYPS5_AGC_NATIVE (on by default here): the driver's own code for this CPU (-march, FMA contraction off so its
+# float results stay the same) with link-time optimization; +3.2 % world presents (best257-260, two pairs of
+# unprofiled legs). Target flags only: the global flags that key the shader cache, and the recompiler target, are
+# unchanged. Turn it off (or set ANYPS5_AGC_MARCH) for a build that runs on other CPUs.
+option(ANYPS5_AGC_NATIVE "Build libSceAgcDriver with -march and LTO" ON)
+set(ANYPS5_AGC_MARCH "native" CACHE STRING "-march value for ANYPS5_AGC_NATIVE")
+if(ANYPS5_AGC_NATIVE)
+    target_compile_options(libSceAgcDriver PRIVATE -march=${ANYPS5_AGC_MARCH} -ffp-contract=off -fno-semantic-interposition)
+    set_property(TARGET libSceAgcDriver PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(agc_driver_draw_program_trace_tests
