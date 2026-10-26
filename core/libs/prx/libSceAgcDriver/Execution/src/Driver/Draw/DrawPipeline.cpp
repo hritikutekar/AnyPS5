@@ -123,6 +123,7 @@ DrawPipeline::Item* DrawPipeline::nextPrepare() {
 void DrawPipeline::prepareLoop() {
     PerformanceTrace::BindThread("draw preparer");
     NameCurrentThread("prepare");
+    NoteCriticalThread(CriticalThread::Preparer);
     for (;;) {
         Prepare job;
         {
@@ -312,6 +313,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     NameCurrentThread("commit");
+    NoteCriticalThread(CriticalThread::Committer);
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;

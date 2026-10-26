@@ -73,6 +73,7 @@ enum class RuntimeSwitch : std::size_t {
     NoBdaKeyHash,
     NoFastDccFill,
     NoSmallDispatchCache,
+    NoThreadPinning,
     Count,
 };
 
