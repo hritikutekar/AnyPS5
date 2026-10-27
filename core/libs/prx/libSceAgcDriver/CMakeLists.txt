@@ -412,10 +412,11 @@ target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-libs,$<TARGET_FILE_
 # ANYPS5_AGC_NATIVE (on by default here): the driver's own code for this CPU (-march, FMA contraction off so its
 # float results stay the same) with link-time optimization; +3.2 % world presents (best257-260, two pairs of
 # unprofiled legs). Target flags only: the global flags that key the shader cache, and the recompiler target, are
-# unchanged. Turn it off (or set ANYPS5_AGC_MARCH) for a build that runs on other CPUs.
+# unchanged. Turn it off (or set ANYPS5_AGC_MARCH) for a build that runs on other CPUs. GCC/Clang only: MSVC and
+# clang-cl builds keep their usual flags.
 option(ANYPS5_AGC_NATIVE "Build libSceAgcDriver with -march and LTO" ON)
 set(ANYPS5_AGC_MARCH "native" CACHE STRING "-march value for ANYPS5_AGC_NATIVE")
-if(ANYPS5_AGC_NATIVE)
+if(ANYPS5_AGC_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     target_compile_options(libSceAgcDriver PRIVATE -march=${ANYPS5_AGC_MARCH} -ffp-contract=off -fno-semantic-interposition)
     set_property(TARGET libSceAgcDriver PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
@@ -425,7 +426,9 @@ endif()
 # profile; a function changed since the training run builds without it (a coverage-mismatch warning).
 set(ANYPS5_AGC_PGO "" CACHE STRING "Profile-guided optimization of libSceAgcDriver: generate, use or empty")
 set(ANYPS5_AGC_PGO_DIR "${CMAKE_BINARY_DIR}/agc-pgo" CACHE PATH "Profile directory for ANYPS5_AGC_PGO")
-if(ANYPS5_AGC_PGO STREQUAL "generate")
+if(NOT ANYPS5_AGC_PGO STREQUAL "" AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(WARNING "ANYPS5_AGC_PGO uses GCC's profile flags; ignored for ${CMAKE_CXX_COMPILER_ID}")
+elseif(ANYPS5_AGC_PGO STREQUAL "generate")
     target_compile_options(libSceAgcDriver PRIVATE -fprofile-generate=${ANYPS5_AGC_PGO_DIR} -fprofile-update=prefer-atomic)
     target_link_options(libSceAgcDriver PRIVATE -fprofile-generate=${ANYPS5_AGC_PGO_DIR} -fprofile-update=prefer-atomic LINKER:-u,__gcov_dump)
 elseif(ANYPS5_AGC_PGO STREQUAL "use")
