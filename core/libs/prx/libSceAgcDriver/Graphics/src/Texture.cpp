@@ -2463,8 +2463,8 @@ bool StorageTexture::Refresh() {
             } else {
                 overlapKind = "same range, other dimension or layers";
             }
-            char detail[160];
-            std::snprintf(detail, sizeof(detail), " (%ux%u fmt %u tile %u mips %u vs %ux%u fmt %u tile %u mips %u)", descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, theirs.width, theirs.height, static_cast<unsigned>(theirs.format), static_cast<unsigned>(theirs.tileMode), theirs.mipCount);
+            char detail[320];
+            std::snprintf(detail, sizeof(detail), " (%ux%u fmt %u tile %u mips %u at 0x%llx+0x%llx extent 0x%llx vs %ux%u fmt %u tile %u mips %u at 0x%llx+0x%llx extent 0x%llx)", descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(elementExtent), theirs.width, theirs.height, static_cast<unsigned>(theirs.format), static_cast<unsigned>(theirs.tileMode), theirs.mipCount, static_cast<unsigned long long>(theirs.baseAddress), static_cast<unsigned long long>(texture->guestBytes), static_cast<unsigned long long>(texture->elementExtent));
             overlapKind += detail;
             break;
         }
