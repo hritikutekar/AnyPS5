@@ -2172,7 +2172,7 @@ constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch",
 // is every untagged thread (the presenter, game threads); the queue workers take a column each on
 // their first hold. A contended lock() snapshots the matrix before and after its wait and credits
 // the deltas (the holds that ended during the wait) to the waiter's site.
-constexpr std::size_t HolderColumns = 12;
+constexpr std::size_t HolderColumns = 20;
 constexpr std::uint32_t UnassignedHolder = 0xfffffffeu;
 constexpr std::uint32_t PresenterHolderTag = 0xfffffffdu;
 constexpr int PresenterColumn = 1;
@@ -2195,6 +2195,39 @@ struct HolderMatrix {
 HolderMatrix& Holders() {
     static HolderMatrix matrix;
     return matrix;
+}
+
+// Untagged threads (draw committers, the preparer, game threads) are told apart by their thread name: each name
+// takes a pseudo-tag 0xe00000nn on the thread's first hold, so the holder matrix names them ("agc commit", ...).
+// Names beyond the registry share column 0 ("untagged") as before.
+constexpr std::uint32_t NamedHolderBase = 0xe0000000u;
+constexpr std::size_t NamedHolders = 8;
+struct NamedHolderRegistry {
+    std::mutex mutex;
+    std::array<std::array<char, 16>, NamedHolders> names{};
+    std::size_t count = 0;
+};
+
+NamedHolderRegistry& NamedHolderNames() {
+    static NamedHolderRegistry registry;
+    return registry;
+}
+
+std::uint32_t NamedHolderTag() {
+    std::array<char, 16> name{};
+#if defined(__linux__)
+    if (pthread_getname_np(pthread_self(), name.data(), name.size()) != 0) return 0xffffffffu;
+#else
+    return 0xffffffffu;
+#endif
+    auto& registry = NamedHolderNames();
+    std::lock_guard lock(registry.mutex);
+    for (std::size_t i = 0; i < registry.count; ++i) {
+        if (registry.names[i] == name) return NamedHolderBase | static_cast<std::uint32_t>(i);
+    }
+    if (registry.count == NamedHolders) return 0xffffffffu;
+    registry.names[registry.count] = name;
+    return NamedHolderBase | static_cast<std::uint32_t>(registry.count++);
 }
 
 std::size_t HolderColumnFor(std::uint32_t tag) {
@@ -2269,7 +2302,7 @@ void EndHold() {
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
     stats.siteMaxHeldMs[stats.holdSite] = std::max(stats.siteMaxHeldMs[stats.holdSite], heldMs);
-    if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(stats.tag));
+    if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(stats.tag == 0xffffffffu ? NamedHolderTag() : stats.tag));
     Holders().heldNs[static_cast<std::size_t>(stats.holderColumn)][stats.holdSite].fetch_add(static_cast<std::uint64_t>(heldNs), std::memory_order_relaxed);
 }
 
@@ -2277,6 +2310,11 @@ const char* HolderName(std::size_t column, char* text, std::size_t size) {
     const auto tag = Holders().tags[column].load(std::memory_order_relaxed);
     if (tag == 0xffffffffu) std::snprintf(text, size, "untagged");
     else if (tag == PresenterHolderTag) std::snprintf(text, size, "presenter");
+    else if ((tag & 0xffffff00u) == NamedHolderBase && (tag & 0xffu) < NamedHolders) {
+        auto& registry = NamedHolderNames();
+        std::lock_guard lock(registry.mutex);
+        std::snprintf(text, size, "'%s'", registry.names[tag & 0xffu].data());
+    }
     else std::snprintf(text, size, "q0x%x", tag);
     return text;
 }
