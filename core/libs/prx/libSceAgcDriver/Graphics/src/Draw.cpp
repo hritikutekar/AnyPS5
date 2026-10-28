@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1538,7 +1539,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 static std::deque<ClampMemo> memos;
                 const bool memoize = !RuntimeSwitches::Set(RuntimeSwitch::NoIndexClampMemo);
                 std::shared_ptr<Buffer> reused;
-                if (memoize && !Recorder::SnapshotWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
+                // Diagnostic (APS5_PROFILE_DRAW): why a clamp missed the memo, and for a changed buffer how many of its
+                // 64 KiB blocks moved (and by CPU stores); [clamp-memo] every 10 s.
+                static const bool clampProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                int missKind = 1;
+                std::size_t movedBlocks = 0, cpuBlocks = 0, totalBlocks = 0;
+                const bool pendingWrites = Recorder::SnapshotWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                if (memoize && !pendingWrites) {
                     GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
                     std::lock_guard memoLock(memoMutex);
                     for (const auto& memo : memos) {
@@ -1546,8 +1553,39 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                         if (GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), memo.generation)) {
                             reused = memo.buffer;
                             highest = memo.highest;
+                        } else {
+                            missKind = 2;
+                            if (clampProfile) {
+                                totalBlocks = ((draw.indexAddress + indexBytes + 0xffffu) >> 16u) - (draw.indexAddress >> 16u);
+                                std::vector<std::uint64_t> generations(totalBlocks, memo.generation);
+                                std::vector<std::uint8_t> changed(totalBlocks), cpu(totalBlocks);
+                                GuestMemory::ChangedBlocks(draw.indexAddress, static_cast<std::size_t>(indexBytes), generations, changed, cpu);
+                                for (std::size_t k = 0; k < totalBlocks; ++k) {
+                                    movedBlocks += changed[k] != GuestMemory::BlockUnchanged;
+                                    cpuBlocks += changed[k] != GuestMemory::BlockUnchanged && cpu[k] != 0;
+                                }
+                            }
                         }
                         break;
+                    }
+                } else if (pendingWrites) {
+                    missKind = 0;
+                }
+                if (clampProfile && reused == nullptr) {
+                    static std::mutex statsMutex;
+                    static std::array<std::uint64_t, 3> misses{};
+                    static std::uint64_t moved = 0, cpu = 0, blocks = 0;
+                    static auto report = std::chrono::steady_clock::now();
+                    std::lock_guard statsLock(statsMutex);
+                    ++misses[static_cast<std::size_t>(missKind)];
+                    moved += movedBlocks;
+                    cpu += cpuBlocks;
+                    blocks += totalBlocks;
+                    if (std::chrono::steady_clock::now() - report >= std::chrono::seconds(10)) {
+                        report = std::chrono::steady_clock::now();
+                        AgcDriver::ProfilePrint_nid_no_patch("[clamp-memo] (10 s) misses: GPU writes pending %llu, no entry %llu, changed %llu (blocks moved %llu of %llu, by CPU stores %llu)\n", static_cast<unsigned long long>(misses[0]), static_cast<unsigned long long>(misses[1]), static_cast<unsigned long long>(misses[2]), static_cast<unsigned long long>(moved), static_cast<unsigned long long>(blocks), static_cast<unsigned long long>(cpu));
+                        misses = {};
+                        moved = cpu = blocks = 0;
                     }
                 }
                 if (reused == nullptr) {
@@ -1556,6 +1594,33 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                     auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
                     const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
                     GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                    if (clampProfile && missKind == 2) {
+                        // Diagnostic: whether the index buffer's bytes really changed since the previous miss (block hashes of
+                        // the guest bytes read, before the clamp), [clamp-memo] "content".
+                        static std::mutex hashMutex;
+                        static std::unordered_map<std::uint64_t, std::vector<ContentHash::Hash128>> lastHashes;
+                        static std::uint64_t sameContent = 0, changedContent = 0, changedBlocks = 0;
+                        static auto hashReport = std::chrono::steady_clock::now();
+                        std::vector<ContentHash::Hash128> hashes(GuestMemory::HashBlockCount(draw.indexAddress, static_cast<std::size_t>(indexBytes)));
+                        GuestMemory::HashBlocksOf(draw.indexAddress, bytes, hashes);
+                        std::lock_guard hashLock(hashMutex);
+                        auto& last = lastHashes[draw.indexAddress ^ (indexBytes << 1u)];
+                        if (last.size() == hashes.size()) {
+                            std::size_t differing = 0;
+                            for (std::size_t k = 0; k < hashes.size(); ++k) differing += !(hashes[k] == last[k]);
+                            if (differing == 0) ++sameContent;
+                            else {
+                                ++changedContent;
+                                changedBlocks += differing;
+                            }
+                        }
+                        last = std::move(hashes);
+                        if (std::chrono::steady_clock::now() - hashReport >= std::chrono::seconds(10)) {
+                            hashReport = std::chrono::steady_clock::now();
+                            AgcDriver::ProfilePrint_nid_no_patch("[clamp-memo] (10 s) content of changed buffers: identical %llu, different %llu (%llu blocks differ)\n", static_cast<unsigned long long>(sameContent), static_cast<unsigned long long>(changedContent), static_cast<unsigned long long>(changedBlocks));
+                            sameContent = changedContent = changedBlocks = 0;
+                        }
+                    }
                     highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                     reused = std::move(clamped);
                     if (memoize && generation != 0) {
