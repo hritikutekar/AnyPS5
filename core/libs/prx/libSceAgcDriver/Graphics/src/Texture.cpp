@@ -147,8 +147,21 @@ struct StorageTraffic {
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::uint64_t directWriteBacks = 0;
+    // Per surface ("0x<address> WxH fmt F mips M"): uploads and write-backs (count, bytes) and the reason that
+    // carried most of them, for the [storage-surfaces] line (top 8 by bytes).
+    struct SurfaceTraffic {
+        std::uint64_t uploads = 0, uploadBytes = 0, writeBacks = 0, writeBackBytes = 0;
+        std::map<std::string, std::uint64_t> reasons;
+    };
+    std::map<std::string, SurfaceTraffic> surfaces;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+std::string surfaceName(const GuestTextureResource& surface) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "0x%llx %ux%u fmt %u mips %u", static_cast<unsigned long long>(surface.baseAddress), surface.width, surface.height, surface.format, surface.mipCount);
+    return text;
+}
 
 StorageTraffic& Traffic() {
     static StorageTraffic traffic;
@@ -183,10 +196,26 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
+    if (!traffic.surfaces.empty()) {
+        std::vector<std::pair<std::uint64_t, const std::string*>> order;
+        for (const auto& [name, surface] : traffic.surfaces) order.emplace_back(surface.uploadBytes + surface.writeBackBytes, &name);
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string surfaces;
+        for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
+            const auto& surface = traffic.surfaces[*order[i].second];
+            std::string reasons;
+            for (const auto& [reason, bytes] : surface.reasons) reasons += " " + reason + " " + std::to_string(bytes >> 20) + "M";
+            char item[256];
+            std::snprintf(item, sizeof(item), "\n  %s: uploads %llu / %.1f MiB, write-backs %llu / %.1f MiB;%s", order[i].second->c_str(), static_cast<unsigned long long>(surface.uploads), surface.uploadBytes / 1048576.0, static_cast<unsigned long long>(surface.writeBacks), surface.writeBackBytes / 1048576.0, reasons.c_str());
+            surfaces += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[storage-surfaces] (10 s) top surfaces by storage traffic (%zu surfaces):%s\n", traffic.surfaces.size(), surfaces.c_str());
+        traffic.surfaces.clear();
+    }
     traffic.directWriteBacks = 0;
 }
 
-void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+void countStorageUpload(std::size_t path, std::uint64_t bytes, const GuestTextureResource& surface) {
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -195,16 +224,24 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     auto& reason = traffic.uploadReasons[uploadReason != nullptr ? uploadReason : "other"];
     ++reason.first;
     reason.second += bytes;
+    auto& perSurface = traffic.surfaces[surfaceName(surface)];
+    ++perSurface.uploads;
+    perSurface.uploadBytes += bytes;
+    perSurface.reasons[std::string("up:") + (uploadReason != nullptr ? uploadReason : "other")] += bytes;
     reportStorageTraffic(traffic);
 }
 
-void countStorageWriteBack(std::uint64_t bytes, bool direct) {
+void countStorageWriteBack(std::uint64_t bytes, bool direct, const GuestTextureResource& surface) {
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
     auto& totals = traffic.writeBacks[flushReason != nullptr ? flushReason : "other"];
     ++totals.first;
     totals.second += bytes;
+    auto& perSurface = traffic.surfaces[surfaceName(surface)];
+    ++perSurface.writeBacks;
+    perSurface.writeBackBytes += bytes;
+    perSurface.reasons[std::string("wb:") + (flushReason != nullptr ? flushReason : "other")] += bytes;
     if (direct) ++traffic.directWriteBacks;
     reportStorageTraffic(traffic);
 }
@@ -3004,7 +3041,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
-        countStorageUpload(0, guestBytes);
+        countStorageUpload(0, guestBytes, descriptor);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
@@ -3034,7 +3071,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 runs.emplace_back(0, guestBytes);
             }
             const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
-            countStorageUpload(1, uploadedBytes);
+            countStorageUpload(1, uploadedBytes, descriptor);
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
@@ -3096,7 +3133,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             singlePassMoves.fetch_add(1, std::memory_order_relaxed);
             if (batch) batch->SubmitAndWait();
             else recorder->EndGpuTiming(timing, uploadedBytes);
-            countStorageUpload(1, uploadedBytes);
+            countStorageUpload(1, uploadedBytes, descriptor);
             ++Profile().storageDirectUploads;
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -3133,7 +3170,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, uploadedBytes);
-        countStorageUpload(1, uploadedBytes);
+        countStorageUpload(1, uploadedBytes, descriptor);
         ++Profile().storageDirectUploads;
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -3188,7 +3225,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch.SubmitAndWait();
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
-    countStorageUpload(2, guestBytes);
+    countStorageUpload(2, guestBytes, descriptor);
     ++version;
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }
@@ -5668,7 +5705,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
-    countStorageUpload(3, bytes);
+    countStorageUpload(3, bytes, descriptor);
     if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
         borrowedUnits.assign(trackedLayers, false);
         borrowedFrom = source.weak_from_this();
@@ -5899,7 +5936,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
-            countStorageWriteBack(storedBytes, true);
+            countStorageWriteBack(storedBytes, true, descriptor);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
             traceKeyStore("block write-back", descriptor, guestBytes);
@@ -6015,7 +6052,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
         }
-        countStorageWriteBack(storedBytes, true);
+        countStorageWriteBack(storedBytes, true, descriptor);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
         forgetStored();
@@ -6148,7 +6185,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
     batch.SubmitAndWait();
     APS5_LOG_CHARS_OUT("StorageTexture writeback done");
-    countStorageWriteBack(guestBytes, false);
+    countStorageWriteBack(guestBytes, false, descriptor);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
         char name[64];
