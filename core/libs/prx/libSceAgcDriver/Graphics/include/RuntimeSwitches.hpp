@@ -74,6 +74,9 @@ enum class RuntimeSwitch : std::size_t {
     NoFastDccFill,
     NoSmallDispatchCache,
     NoThreadPinning,
+    NoIndexClampMemo,
+    NoGdsGpuFill,
+    NoDmaCopyBehindWrites,
     Count,
 };
 
