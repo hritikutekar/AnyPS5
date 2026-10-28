@@ -81,6 +81,7 @@ enum class RuntimeSwitch : std::size_t {
     NoClearSnapshotReuse,
     NoGpuIndexClamp,
     NoGpuWrittenInPlace,
+    NoIncrementalShadowCount,
     Count,
 };
 
