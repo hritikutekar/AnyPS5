@@ -59,6 +59,12 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
+    // Diagnostic (APS5_PROFILE_DRAW): what queue 0's worker is doing, set per packet; the committer charges
+    // each of its idle gaps to the activity at the gap's start ([draw] pipelined "committer idle by ...").
+    enum class WorkerState : std::uint8_t { BetweenSubmissions, Draw, Dispatch, DispatchIndirect, Wait, Flip, Dma, Other, Count };
+    static std::atomic<std::uint8_t>& WorkerActivity();
+    // Queue 0's presents (set at each flip packet), for the commit trace's frame numbers.
+    static std::atomic<std::uint64_t>& Presents();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current());
@@ -184,6 +190,9 @@ private:
     std::uint64_t drainWakeNs = 0;
     std::uint64_t committerIdles = 0;
     std::uint64_t committerIdleNs = 0;
+    std::uint8_t idleStartActivity = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(WorkerState::Count)> idleByActivityNs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(WorkerState::Count)> idleByActivity{};
     std::uint64_t committerWakeNs = 0;
     std::uint64_t writeScans = 0;
     std::uint64_t writeScanSamples = 0;

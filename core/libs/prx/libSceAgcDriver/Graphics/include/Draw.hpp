@@ -147,6 +147,12 @@ void CountDrawSkip(DrawSkip kind, double us);
 // which the switch can turn into APS5_NO_RECORD_COPIED_DRAWS. Until then such draws are recorded and
 // waited for at once. Read and written under GuestMemory::GpuMutex, like the device's list.
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
+// Diagnostic (APS5_PROFILE_DRAW, [commit-deps]): a commit's reads and writes on queue 0's committer, for the
+// distance to the newest earlier commit (within 64) whose writes it reads; `unknown` when its reads are not
+// known (address-based). Feasibility data for preparing commits in parallel.
+void FinishCommitTrace(std::uint64_t present, double costUs);
+void NoteCommitTracePassBegun();
+void NoteCommitAccess(std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, std::span<const std::pair<VkImage, bool>> images, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::pair<VkImage, bool>> attachments, bool unknown, bool dispatch);
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 

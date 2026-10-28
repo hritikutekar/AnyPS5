@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <array>
+#include <mutex>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
@@ -234,6 +236,25 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
+        }
+        if (DrawPipeline::Active() && !pipelineCandidate && DrawPipeline::Queue0().Busy() && submission.queue == 0) {
+            // Diagnostic (APS5_PROFILE_DRAW): why queue-0 dispatches that drain the pipeline are not items; [dispatch-drain].
+            static const bool reasonProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (reasonProfile) {
+                static std::mutex reasonMutex;
+                static std::array<std::uint64_t, 7> reasons{};
+                static auto reasonReport = std::chrono::steady_clock::now();
+                std::lock_guard reasonLock(reasonMutex);
+                const auto code = std::span(snapshot.code).subspan(codeOffset);
+                const std::size_t reason = fromAhead ? 0 : !DispatchItemsEnabled() ? 1 : indirectArguments != 0 ? 2 : !deferredLabels().labels.empty() ? 3 : matchesCopyKernel(code, userData, compute) ? 4 : MatchesStreamCopyKernel(code, userData, compute) ? 5 : 6;
+                ++reasons[reason];
+                if (std::chrono::steady_clock::now() - reasonReport >= std::chrono::seconds(10)) {
+                    reasonReport = std::chrono::steady_clock::now();
+                    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-drain] (10 s) queue-0 dispatches draining a busy pipeline, by reason: resolved ahead %llu, items off %llu, indirect %llu, deferred labels %llu, copy kernel %llu, stream copy kernel %llu, other %llu\n",
+                        static_cast<unsigned long long>(reasons[0]), static_cast<unsigned long long>(reasons[1]), static_cast<unsigned long long>(reasons[2]), static_cast<unsigned long long>(reasons[3]), static_cast<unsigned long long>(reasons[4]), static_cast<unsigned long long>(reasons[5]), static_cast<unsigned long long>(reasons[6]));
+                    reasons = {};
+                }
+            }
         }
         if (DrawPipeline::Active() && !pipelineCandidate) {
             static const bool q30Profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

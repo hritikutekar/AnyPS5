@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -233,6 +234,7 @@ void Driver::deliverFlipEopInterrupt(std::uint32_t queue) {
             eopSelfSignalFlips.erase(latched);
         }
     }
+    if (queue == 0) NoteQueue0FlipEop();
     AgcDriverDeliverEopInterrupt(queue);
 }
 
@@ -261,7 +263,61 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     if (report && bucket != &WorkerProfile::waitMs) PerformanceCounters::AddDriverNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
 }
 
+namespace {
+
+// Diagnostic (APS5_PROFILE_DRAW): queue 0's submission timeline, [q0-submission] every 10 s: the gap since the
+// previous submission's execute ended, draw-ahead posting, execute start to the first draw/dispatch/wait, and
+// the whole execute.
+struct Q0SubmissionTimeline {
+    std::chrono::steady_clock::time_point lastEnd{}, start{}, report = std::chrono::steady_clock::now();
+    bool firstSeen = true;
+    std::uint64_t submissions = 0;
+    double gapMs = 0, postMs = 0, firstWorkMs = 0, executeMs = 0, maxGapMs = 0, maxFirstMs = 0;
+};
+
+Q0SubmissionTimeline& q0Timeline() {
+    static Q0SubmissionTimeline timeline;
+    return timeline;
+}
+
+bool q0TimelineProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+}
+
 void Driver::execute(const Submission& submission) {
+    const bool q0Timed = submission.queue == 0 && q0TimelineProfiled() && !submission.suspend;
+    struct Q0ExecuteEnd {
+        bool timed;
+        ~Q0ExecuteEnd() {
+            if (!timed) return;
+            auto& timeline = q0Timeline();
+            const auto now = std::chrono::steady_clock::now();
+            timeline.executeMs += std::chrono::duration<double, std::milli>(now - timeline.start).count();
+            ++timeline.submissions;
+            timeline.lastEnd = now;
+            if (now - timeline.report < std::chrono::seconds(10) || timeline.submissions == 0) return;
+            const auto n = static_cast<double>(timeline.submissions);
+            AgcDriver::ProfilePrint_nid_no_patch("[q0-submission] (10 s) %llu submissions; per submission: gap since the previous execute %.1f ms (max %.1f), draw-ahead post %.1f ms, execute start to first draw/dispatch/wait %.1f ms (max %.1f), execute %.1f ms\n",
+                static_cast<unsigned long long>(timeline.submissions), timeline.gapMs / n, timeline.maxGapMs, timeline.postMs / n, timeline.firstWorkMs / n, timeline.maxFirstMs, timeline.executeMs / n);
+            const auto lastEnd = timeline.lastEnd;
+            timeline = {};
+            timeline.lastEnd = lastEnd;
+            timeline.report = now;
+        }
+    } q0ExecuteEnd{q0Timed};
+    if (q0Timed) {
+        auto& timeline = q0Timeline();
+        timeline.start = std::chrono::steady_clock::now();
+        timeline.firstSeen = false;
+        if (timeline.lastEnd != std::chrono::steady_clock::time_point{}) {
+            const auto gap = std::chrono::duration<double, std::milli>(timeline.start - timeline.lastEnd).count();
+            timeline.gapMs += gap;
+            timeline.maxGapMs = std::max(timeline.maxGapMs, gap);
+        }
+    }
     // The async compute ring records into the recorder's second lane (Recorder::AsyncLaneRing).
     const Graphics::Recorder::LaneScope laneScope(Graphics::Recorder::LaneOfQueue(submission.queue));
     auto* submissionTiming = includeTimingSubmission(submission, true);
@@ -333,7 +389,9 @@ void Driver::execute(const Submission& submission) {
     if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawAhead) && DrawAhead::HasDirectDraws(submission.commands)) {
         if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
         ahead = drawAhead.get();
+        const auto postStart = q0Timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         aheadSegment = ahead->Post(submission, queue);
+        if (q0Timed) q0Timeline().postMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - postStart).count();
     }
     struct RetireDrawAhead {
         DrawAhead* drawAhead;
@@ -352,9 +410,14 @@ void Driver::execute(const Submission& submission) {
         // APS5_DUMP_QUEUE_SKIP=<n>: the first n submissions of the queue are not dumped (to reach gameplay).
         static const long skip = [] { const char* text = std::getenv("APS5_DUMP_QUEUE_SKIP"); return text ? std::strtol(text, nullptr, 10) : 0L; }();
         static long dumped = 0;
-        if (dumped++ >= skip && dumped <= skip + 40) {
+        // APS5_DUMP_QUEUE_TAIL=<n>: only the last n packets of each dumped submission, and only two submissions.
+        static const long tail = [] { const char* text = std::getenv("APS5_DUMP_QUEUE_TAIL"); return text ? std::strtol(text, nullptr, 10) : 0L; }();
+        if (dumped++ >= skip && dumped <= skip + (tail > 0 ? 2 : 40)) {
             std::string text = "[queue] submission " + std::to_string(submission.serial) + ":\n";
-            for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+            std::vector<std::size_t> starts;
+            for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) starts.push_back(cursor);
+            const auto first = tail > 0 && starts.size() > static_cast<std::size_t>(tail) ? starts[starts.size() - static_cast<std::size_t>(tail)] : 0;
+            for (std::size_t cursor = first; cursor < submission.commands.size();) {
                 const auto header = submission.commands[cursor];
                 const auto count = Pm4::PacketWords(header);
                 char line[200];
@@ -440,6 +503,19 @@ void Driver::execute(const Submission& submission) {
             if (GuestMemory::Accessible(reinterpret_cast<const void*>(awaited), bytes) && Pm4::WaitSatisfiedUnchecked(packet) && !DrawPipeline::Queue0().Overlaps(awaited, bytes) && !DrawPipeline::Queue0().PendingLabel(awaited, bytes).has_value() && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, bytes)) {
                 keptForWait = true;
                 DrawPipeline::Queue0().Note(DrawPipeline::Event::SatisfiedWaitKept);
+            }
+        }
+        if (submission.queue == 0) {
+            using State = DrawPipeline::WorkerState;
+            const auto state = header == FlipPacketHeader ? State::Flip : opcode == 0x15 ? State::Dispatch : opcode == 0x16 ? State::DispatchIndirect : (opcode == 0x3c || opcode == 0x93) ? State::Wait : opcode == 0x50 ? State::Dma
+                : (opcode == 0x24 || opcode == 0x25 || opcode == 0x26 || opcode == 0x27 || opcode == 0x28 || opcode == 0x2c || opcode == 0x2d || opcode == 0x2e || opcode == 0x35 || opcode == 0x38) ? State::Draw : State::Count;
+            if (state != State::Count) DrawPipeline::WorkerActivity().store(static_cast<std::uint8_t>(state), std::memory_order_relaxed);
+            if (state != State::Count && q0TimelineProfiled() && !q0Timeline().firstSeen) {
+                auto& timeline = q0Timeline();
+                timeline.firstSeen = true;
+                const auto first = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - timeline.start).count();
+                timeline.firstWorkMs += first;
+                timeline.maxFirstMs = std::max(timeline.maxFirstMs, first);
             }
         }
         if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
@@ -548,6 +624,7 @@ void Driver::execute(const Submission& submission) {
             }
             if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
             ++flipsCounted;
+            if (submission.queue == 0) DrawPipeline::Presents().store(flipsCounted.load(), std::memory_order_relaxed);
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
             if (Graphics::AbConfigured()) {

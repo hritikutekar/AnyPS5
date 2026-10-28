@@ -755,6 +755,81 @@ struct VulkanDevice::State {
                 }
             }
             const double gapMs = stamped ? (lastNs - firstNs) / 1e6 - busyMs : 0;
+            // Diagnostic (APS5_PROFILE_DRAW): the frame's final continuous GPU busy run (both lanes merged; a run
+            // ends at an idle gap over 1 ms), the GPU work every saving inside of which shortens the frame while the
+            // title waits for the flip; [gpu-tail] every 10 s.
+            static const bool tailProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (tailProfile && stamped) {
+                std::vector<std::pair<double, double>> spans;
+                for (const auto& batch : batches) {
+                    if (batch.gpuEndNs > batch.gpuStartNs) spans.emplace_back(batch.gpuStartNs, batch.gpuEndNs);
+                }
+                std::sort(spans.begin(), spans.end());
+                std::vector<std::pair<double, double>> merged;
+                for (const auto& span : spans) {
+                    if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
+                    else merged.push_back(span);
+                }
+                // Runs (gaps over 1 ms split them), newest first: the last three with the idle gap before each, and
+                // the GPU busy time inside the frame's final 120 ms.
+                std::vector<std::array<double, 3>> runs;  // start, end, busy
+                for (const auto& span : merged) {
+                    if (!runs.empty() && span.first - runs.back()[1] <= 1e6) {
+                        runs.back()[1] = span.second;
+                        runs.back()[2] += span.second - span.first;
+                    } else {
+                        runs.push_back({span.first, span.second, span.second - span.first});
+                    }
+                }
+                const double windowStart = merged.back().second - 120e6;
+                double windowBusy = 0;
+                for (const auto& span : merged) {
+                    if (span.second > windowStart) windowBusy += span.second - std::max(span.first, windowStart);
+                }
+                static double windowBusyMs = 0, frameSpanMs = 0;
+                static std::array<double, 3> runMs{}, runBusyMs{}, gapBeforeMs{};
+                static std::uint64_t frames = 0;
+                static auto tailReport = std::chrono::steady_clock::now();
+                windowBusyMs += windowBusy / 1e6;
+                frameSpanMs += (lastNs - firstNs) / 1e6;
+                for (std::size_t k = 0; k < 3 && k < runs.size(); ++k) {
+                    const auto& run = runs[runs.size() - 1 - k];
+                    runMs[k] += (run[1] - run[0]) / 1e6;
+                    runBusyMs[k] += run[2] / 1e6;
+                    if (runs.size() >= k + 2) gapBeforeMs[k] += (run[0] - runs[runs.size() - 2 - k][1]) / 1e6;
+                }
+                // The end-of-frame run: the longer of the last two runs (the newest is usually the present blit alone),
+                // attributed to timed keys when APS5_PROFILE_GPU ranges exist.
+                static std::map<std::uint64_t, double> tailByKey;
+                static double tailRunTotalMs = 0;
+                if (!runs.empty()) {
+                    auto pick = runs.size() - 1;
+                    if (runs.size() >= 2 && runs[runs.size() - 2][2] > runs[pick][2]) pick = runs.size() - 2;
+                    tailRunTotalMs += (runs[pick][1] - runs[pick][0]) / 1e6;
+                    for (const auto& [key, ms] : Graphics::Recorder::TimedKeysInWindow(runs[pick][0], runs[pick][1])) tailByKey[key] += ms;
+                }
+                ++frames;
+                if (std::chrono::steady_clock::now() - tailReport >= std::chrono::seconds(10)) {
+                    tailReport = std::chrono::steady_clock::now();
+                    const auto n = static_cast<double>(frames);
+                    std::vector<std::pair<std::uint64_t, double>> top(tailByKey.begin(), tailByKey.end());
+                    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                    std::string attribution;
+                    for (std::size_t k = 0; k < top.size() && k < 14; ++k) {
+                        char item[80];
+                        std::snprintf(item, sizeof(item), " %s %.1f", Graphics::Recorder::TimedKeyName(top[k].first).c_str(), top[k].second / n);
+                        attribution += item;
+                    }
+                    if (!attribution.empty()) AgcDriver::ProfilePrint_nid_no_patch("[gpu-tail] end-of-frame run %.1f ms per frame, timed GPU ms per frame inside it:%s\n", tailRunTotalMs / n, attribution.c_str());
+                    tailByKey.clear();
+                    tailRunTotalMs = 0;
+                    AgcDriver::ProfilePrint_nid_no_patch("[gpu-tail] (10 s) %llu frames; per frame: GPU busy in the final 120 ms %.1f ms; last runs (newest first, length/busy, idle gap before): %.1f/%.1f gap %.1f, %.1f/%.1f gap %.1f, %.1f/%.1f gap %.1f ms; frame GPU span %.1f ms\n", static_cast<unsigned long long>(frames), windowBusyMs / n,
+                        runMs[0] / n, runBusyMs[0] / n, gapBeforeMs[0] / n, runMs[1] / n, runBusyMs[1] / n, gapBeforeMs[1] / n, runMs[2] / n, runBusyMs[2] / n, gapBeforeMs[2] / n, frameSpanMs / n);
+                    windowBusyMs = frameSpanMs = 0;
+                    runMs = runBusyMs = gapBeforeMs = {};
+                    frames = 0;
+                }
+            }
             if (auto* frame = PerformanceContext::Current()) frame->NoteRetired(0, busyMs, gapMs);
             presentCounters.gpuBusyMs += busyMs;
             presentCounters.asyncBusyMs += asyncBusyMs;
@@ -5608,6 +5683,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordBind);
     if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);
     else resources.MarkGpuWrites(recorder);
+    static const bool commitDeps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (commitDeps && GuestMemory::CurrentPacket().queue == 0) {
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        reads.clear();
+        const bool unknown = resources.HoldsLease() || resources.UsesAddressTable();
+        if (!unknown) resources.DeviceReads(reads);
+        Graphics::NoteCommitAccess(reads, resources.StorageImages(), resources.GpuWrites(), {}, unknown, true);
+    }
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.

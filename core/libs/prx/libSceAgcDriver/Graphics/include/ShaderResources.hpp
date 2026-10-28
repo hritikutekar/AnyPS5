@@ -422,6 +422,9 @@ public:
         double descriptorsMs = 0;
         double prepareMs = 0;
         double completeMs = 0;
+        // Stage B's image lookups and BDA table, also inside bindingsMs / completeMs.
+        double imagesMs = 0;
+        double bdaMs = 0;
     };
     const BuildTiming& Timing() const { return timing; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so

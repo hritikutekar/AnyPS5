@@ -49,6 +49,10 @@ struct PreparedDraw;
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
+void NoteQueue0FlipEop();
+}
+
+namespace AgcDriver::DriverDetail {
 
 class ShaderRefusal;
 

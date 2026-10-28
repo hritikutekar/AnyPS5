@@ -3386,14 +3386,15 @@ void ShaderResources::buildComplete() {
             if (storageWritten[index] && storageTextures[index] != nullptr && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) depthWrites.push_back(storageTextures[index]);
         }
         if (depthWrites.size() > 1) ValidateStorageDepthWrites(context, depthWrites);
-        timing.bindingsMs += phase(BuildPhase::Images);
+        timing.imagesMs = phase(BuildPhase::Images);
+        timing.bindingsMs += timing.imagesMs;
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
-        phase(BuildPhase::Bda);
+        timing.bdaMs = phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's
             // pointer into them stays valid until the call.

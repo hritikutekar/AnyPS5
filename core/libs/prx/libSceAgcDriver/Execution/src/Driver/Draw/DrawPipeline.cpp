@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -175,6 +176,16 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     GuestMemory::BumpCollectEpoch();
 }
 
+std::atomic<std::uint64_t>& DrawPipeline::Presents() {
+    static std::atomic<std::uint64_t> presents{0};
+    return presents;
+}
+
+std::atomic<std::uint8_t>& DrawPipeline::WorkerActivity() {
+    static std::atomic<std::uint8_t> activity{0};
+    return activity;
+}
+
 unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
@@ -292,6 +303,16 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char handoffs[256];
     std::snprintf(handoffs, sizeof(handoffs), "; hand-offs: %llu room waits woken %.1f us after the pop, %llu drains woken %.1f us after the last pop, committer idle %.1f ms in %llu gaps woken %.1f us after the push", static_cast<unsigned long long>(roomWaits), average(roomWakeNs, roomWaits), static_cast<unsigned long long>(drainWaits), average(drainWakeNs, drainWaits), static_cast<double>(committerIdleNs) / 1e6, static_cast<unsigned long long>(committerIdles), average(committerWakeNs, committerIdles));
     drainText += handoffs;
+    static constexpr const char* activityNames[] = {"between submissions", "draw", "dispatch", "dispatch indirect", "wait", "flip", "dma", "other"};
+    drainText += "; committer idle by worker activity at the gap's start:";
+    for (std::size_t i = 0; i < idleByActivity.size(); ++i) {
+        if (idleByActivity[i] == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %.1f ms (%llu)", activityNames[i], static_cast<double>(idleByActivityNs[i]) / 1e6, static_cast<unsigned long long>(idleByActivity[i]));
+        drainText += item;
+    }
+    idleByActivity = {};
+    idleByActivityNs = {};
     char kept[96];
     std::snprintf(kept, sizeof(kept), "; satisfied waits kept the pipeline %llu", static_cast<unsigned long long>(counted[static_cast<std::size_t>(Event::SatisfiedWaitKept)]));
     drainText += kept;
@@ -330,6 +351,8 @@ void DrawPipeline::run() {
             if (lastFinishNs != 0 && items.front().pushedNs > lastFinishNs) {
                 ++committerIdles;
                 committerIdleNs += static_cast<std::uint64_t>(begun - lastFinishNs);
+                idleByActivityNs[idleStartActivity] += static_cast<std::uint64_t>(begun - lastFinishNs);
+                ++idleByActivity[idleStartActivity];
                 committerWakeNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, begun - items.front().pushedNs));
             }
         }
@@ -349,6 +372,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        Graphics::FinishCommitTrace(Presents().load(std::memory_order_relaxed), static_cast<double>(spent) / 1e3);
         traceWait("DrawPipeline", "commit", start);
         if (fatal != nullptr && !stopped) {
             stopped = true;
@@ -365,6 +389,7 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             lastPopNs = lastFinishNs = nowNs();
+            if (items.empty()) idleStartActivity = std::min<std::uint8_t>(WorkerActivity().load(std::memory_order_relaxed), static_cast<std::uint8_t>(WorkerState::Count) - 1);
             outstanding.fetch_sub(1, std::memory_order_release);
             if (idleWaiters != 0) idle.notify_all();
             if (preparerWaiting) prepareWake.notify_one();

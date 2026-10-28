@@ -288,6 +288,27 @@ private:
     std::atomic<const void*> owner{nullptr};
 };
 
+// APS5_PROFILE_DRAW: the upload loop's per-region import work ([upload-lookup], 10 s): the imports mutex wait,
+// the lookup (findImport, and importAccess when that found none), and how many regions.
+struct UploadLookupTimes {
+    std::atomic<std::uint64_t> regions{0}, lockNs{0}, lookupNs{0}, accesses{0}, accessNs{0}, loops{0}, loopNs{0}, prepares{0}, prepareUs{0};
+    std::atomic<long long> lastReport{0};
+};
+UploadLookupTimes& uploadLookupTimes() {
+    static UploadLookupTimes times;
+    return times;
+}
+void reportUploadLookupTimes() {
+    auto& t = uploadLookupTimes();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = t.lastReport.load();
+    if (nowMs - last < 10000 || !t.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto regions = take(t.regions), lockNs = take(t.lockNs), lookupNs = take(t.lookupNs), accesses = take(t.accesses), accessNs = take(t.accessNs), loops = take(t.loops), loopNs = take(t.loopNs), prepares = take(t.prepares), prepareUs = take(t.prepareUs);
+    std::fprintf(stderr, "[upload-lookup] (10 s): UploadPrepare imports %llu x %.1f us = %.0f ms\n", static_cast<unsigned long long>(prepares), prepares != 0 ? static_cast<double>(prepareUs) / static_cast<double>(prepares) : 0.0, static_cast<double>(prepareUs) / 1000.0);
+    std::fprintf(stderr, "[upload-lookup] (10 s): %llu upload loops %.0f ms (%.1f us each); %llu regions: mutex wait %.0f ms, lookup %.0f ms (importAccess %llu x %.1f us = %.0f ms)\n", static_cast<unsigned long long>(loops), static_cast<double>(loopNs) / 1e6, loops != 0 ? static_cast<double>(loopNs) / 1000.0 / static_cast<double>(loops) : 0.0, static_cast<unsigned long long>(regions), static_cast<double>(lockNs) / 1e6, static_cast<double>(lookupNs) / 1e6, static_cast<unsigned long long>(accesses), accesses != 0 ? static_cast<double>(accessNs) / 1000.0 / static_cast<double>(accesses) : 0.0, static_cast<double>(accessNs) / 1e6);
+}
+
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
@@ -4967,7 +4988,12 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
         importsEpoch = state.epoch;
     }
-    if (profile) importUs.fetch_add(microsecondsSince(started), std::memory_order_relaxed);
+    if (profile) {
+        const auto us = microsecondsSince(started);
+        importUs.fetch_add(us, std::memory_order_relaxed);
+        uploadLookupTimes().prepares.fetch_add(1, std::memory_order_relaxed);
+        uploadLookupTimes().prepareUs.fetch_add(us, std::memory_order_relaxed);
+    }
     // Copies that need no device work: a range no descriptor writes needs no reference copy, and
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
@@ -5141,7 +5167,13 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         bool copyOnGpu = false;
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
+            const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::lock_guard lock(state.mutex);
+            const auto lookupStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (profile) {
+                uploadLookupTimes().lockNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(lookupStart - lockStart).count()), std::memory_order_relaxed);
+                uploadLookupTimes().regions.fetch_add(1, std::memory_order_relaxed);
+            }
             // Imports are made on demand for the registered range around each region.
             if (!importsRefreshed) {
                 if (importsStale(context, state)) refreshImports(context, state, importRanges());
@@ -5154,8 +5186,14 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             const bool sparseRun = region.sparseHeap && region.sparse;
             if (entry == nullptr && !sparseRun) {
+                const auto accessStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 entry = importAccess(context, state, region.begin, region.end, importRanges(), ImportRequester::Build);
+                if (profile) {
+                    uploadLookupTimes().accesses.fetch_add(1, std::memory_order_relaxed);
+                    uploadLookupTimes().accessNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - accessStart).count()), std::memory_order_relaxed);
+                }
             }
+            if (profile) uploadLookupTimes().lookupNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lookupStart).count()), std::memory_order_relaxed);
             bool runImport = false;
             if (entry == nullptr && sparseRun && !region.backed.empty() && region.backed.front().first == region.begin && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
                 const auto committedEnd = region.backed.back().second;
@@ -5250,6 +5288,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
     importUs.fetch_add(loopUs > refreshUs + copyUs ? loopUs - refreshUs - copyUs : 0, std::memory_order_relaxed);
+    uploadLookupTimes().loops.fetch_add(1, std::memory_order_relaxed);
+    uploadLookupTimes().loopNs.fetch_add((loopUs > refreshUs + copyUs ? loopUs - refreshUs - copyUs : 0) * 1000u, std::memory_order_relaxed);
+    reportUploadLookupTimes();
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
@@ -5386,11 +5427,45 @@ void NoteCopyIn(std::uint64_t begin, std::uint64_t end, bool deviceLocal) {
     if (last.size() > (1u << 16)) last.clear();
     ++count[kind];
     bytes[kind] += size;
+    // [staging-ranges]: per range this window, copies, bytes and the programs whose builds copied it.
+    struct RangeCopies {
+        std::uint64_t end = 0, copies = 0, bytes = 0;
+        std::vector<std::uint64_t> programs;
+    };
+    static std::unordered_map<std::uint64_t, RangeCopies> ranges;
+    {
+        auto& entry = ranges[begin];
+        entry.end = std::max(entry.end, end);
+        ++entry.copies;
+        entry.bytes += size;
+        const auto program = Recorder::CurrentWriteOrigin();
+        if (entry.programs.size() < 16 && std::find(entry.programs.begin(), entry.programs.end(), program) == entry.programs.end()) entry.programs.push_back(program);
+    }
     static std::uint64_t localBytes = 0;
     if (deviceLocal) localBytes += size;
     if (std::chrono::steady_clock::now() - lastReport < std::chrono::seconds(10)) return;
     lastReport = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[staging-in] (10 s) copies by range: first %llu (%.1f MiB), CPU-unchanged since the previous copy-in %llu (%.1f MiB), CPU-changed %llu (%.1f MiB), other end %llu (%.1f MiB); device-local shadows %.1f MiB\n", static_cast<unsigned long long>(count[0]), bytes[0] / 1048576.0, static_cast<unsigned long long>(count[1]), bytes[1] / 1048576.0, static_cast<unsigned long long>(count[2]), bytes[2] / 1048576.0, static_cast<unsigned long long>(count[3]), bytes[3] / 1048576.0, localBytes / 1048576.0);
+    {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top;
+        std::uint64_t total = 0;
+        for (const auto& [at, entry] : ranges) {
+            top.emplace_back(entry.bytes, at);
+            total += entry.bytes;
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string line;
+        std::uint64_t shown = 0;
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+            const auto& entry = ranges[top[i].second];
+            shown += entry.bytes;
+            char item[200];
+            std::snprintf(item, sizeof(item), "\n  0x%llx+0x%llx: %llu copies, %.1f MiB (%.1f %%), %zu%s programs", static_cast<unsigned long long>(top[i].second), static_cast<unsigned long long>(entry.end - top[i].second), static_cast<unsigned long long>(entry.copies), entry.bytes / 1048576.0, total != 0 ? 100.0 * static_cast<double>(entry.bytes) / static_cast<double>(total) : 0.0, entry.programs.size(), entry.programs.size() >= 16 ? "+" : "");
+            line += item;
+        }
+        std::fprintf(stderr, "[staging-ranges] (10 s) %zu ranges copied in, %.1f MiB; the top 12 carry %.1f %%:%s\n", ranges.size(), total / 1048576.0, total != 0 ? 100.0 * static_cast<double>(shown) / static_cast<double>(total) : 0.0, line.c_str());
+        ranges.clear();
+    }
     count = {};
     bytes = {};
     localBytes = 0;

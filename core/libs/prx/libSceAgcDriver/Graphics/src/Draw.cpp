@@ -479,6 +479,7 @@ struct DrawProfile {
     // PERF-PLAN D2c sizing: the resources phase and its bindings (image half) of address-based builds only.
     double addressResourcesUs = 0;
     double addressBindingsUs = 0;
+    double addressImagesUs = 0, addressBdaUs = 0, addressUploadUs = 0, addressDescriptorsUs = 0, addressStageAUs = 0, addressStageBUs = 0;
     std::uint64_t draws = 0;
     std::uint64_t recorded = 0;
     std::uint64_t waited = 0;
@@ -556,9 +557,16 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             ++profile.addressBuilds;
             profile.addressResourcesUs += us[PhaseResources];
             profile.addressBindingsUs += built->bindingsMs * 1000.0;
+            profile.addressImagesUs += built->imagesMs * 1000.0;
+            profile.addressBdaUs += built->bdaMs * 1000.0;
+            profile.addressUploadUs += built->uploadMs * 1000.0;
+            profile.addressDescriptorsUs += built->descriptorsMs * 1000.0;
+            profile.addressStageAUs += built->prepareMs * 1000.0;
+            profile.addressStageBUs += built->completeMs * 1000.0;
         }
     }
     ++profile.draws;
+    if (outcome.passBegun) NoteCommitTracePassBegun();
     if (outcome.recorded) ++(outcome.waited ? profile.waited : profile.recorded);
     if (outcome.completion) ++profile.completion;
     if (outcome.passBegun) ++profile.passesBegun;
@@ -600,7 +608,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 0; i < PhaseCount && room(); ++i) {
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
-        if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds; address-based builds per build: resources %.0f us, bindings %.0f us)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds), profile.addressBuilds != 0 ? profile.addressResourcesUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressBindingsUs / static_cast<double>(profile.addressBuilds) : 0.0);
+        if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds; address-based builds per build: resources %.0f us, bindings %.0f us; stage A %.1f, stage B %.1f: images %.1f, upload %.1f, bda %.1f, descriptors %.1f us)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds), profile.addressBuilds != 0 ? profile.addressResourcesUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressBindingsUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressStageAUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressStageBUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressImagesUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressUploadUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressBdaUs / static_cast<double>(profile.addressBuilds) : 0.0, profile.addressBuilds != 0 ? profile.addressDescriptorsUs / static_cast<double>(profile.addressBuilds) : 0.0);
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -648,6 +656,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = profile.addressResourcesUs = profile.addressBindingsUs = 0;
+    profile.addressImagesUs = profile.addressBdaUs = profile.addressUploadUs = profile.addressDescriptorsUs = profile.addressStageAUs = profile.addressStageBUs = 0;
     profile.addressBuilds = 0;
     profile.draws = profile.recorded = profile.waited = profile.completion = 0;
     profile.passesBegun = profile.passesContinued = 0;
@@ -1275,6 +1284,53 @@ std::atomic<std::uint64_t> aheadDrawUses{0};
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
+// Diagnostic (APS5_PROFILE_DRAW): the committer's draw-input paths by time, calls and bytes; [draw-inputs] every 10 s.
+enum class InputPath : std::size_t { IndexCopy, IndexInPlaceScan, IndexHighest, IndexClamp, VertexInPlace, VertexCopy, VertexZeroPadded, Count };
+struct InputPathStats {
+    std::mutex mutex;
+    std::array<double, static_cast<std::size_t>(InputPath::Count)> us{};
+    std::array<std::uint64_t, static_cast<std::size_t>(InputPath::Count)> calls{}, bytes{};
+    std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+};
+bool inputPathsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+InputPathStats& inputPathStats() {
+    static InputPathStats stats;
+    return stats;
+}
+struct InputPathTimer {
+    InputPath path;
+    std::uint64_t bytes;
+    bool enabled;
+    std::chrono::steady_clock::time_point start;
+    InputPathTimer(InputPath path, std::uint64_t bytes) : path(path), bytes(bytes), enabled(inputPathsProfiled()), start(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~InputPathTimer() {
+        if (!enabled) return;
+        auto& stats = inputPathStats();
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(stats.mutex);
+        const auto i = static_cast<std::size_t>(path);
+        stats.us[i] += std::chrono::duration<double, std::micro>(now - start).count();
+        ++stats.calls[i];
+        stats.bytes[i] += bytes;
+        if (now - stats.report < std::chrono::seconds(10)) return;
+        stats.report = now;
+        static constexpr const char* names[] = {"index copy", "index in-place scan", "index highest (copied)", "index clamp", "vertex in place", "vertex copy", "vertex zero-padded"};
+        std::string line = "[draw-inputs] (10 s) by path (calls, ms, MiB):";
+        for (std::size_t k = 0; k < stats.us.size(); ++k) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu %.0f %.1f;", names[k], static_cast<unsigned long long>(stats.calls[k]), stats.us[k] / 1000.0, static_cast<double>(stats.bytes[k]) / 1048576.0);
+            line += item;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        stats.us = {};
+        stats.calls = {};
+        stats.bytes = {};
+    }
+};
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const AheadDraw* ahead = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1440,12 +1496,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        if (import == nullptr) {
+            InputPathTimer timed(InputPath::IndexCopy, indexBytes);
+            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        }
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
+            InputPathTimer timed(InputPath::IndexInPlaceScan, indexBytes);
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
+            InputPathTimer timed(InputPath::IndexHighest, indexBytes);
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
@@ -1465,6 +1526,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 // was read (CPU and GPU writes stamp generations; recorded GPU writes not landed yet refuse the reuse).
                 // Title menu: ~4 draws per frame clamp a 32 MiB index buffer (~5 ms each); +11.9 % menu presents
                 // (best298). APS5_NO_INDEX_CLAMP_MEMO=1 (runtime switch) clamps every time.
+                InputPathTimer timed(InputPath::IndexClamp, indexBytes);
                 struct ClampMemo {
                     std::uint64_t address = 0, bytes = 0, generation = 0;
                     std::uint32_t indexSize = 0, limit = 0;
@@ -1592,12 +1654,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
-        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
+        const HostImport* import = nullptr;
+        {
+            InputPathTimer timed(InputPath::VertexInPlace, bytes);
+            import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite);
+        }
+        if (import != nullptr) {
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
+        InputPathTimer timed(InputPath::VertexCopy, bytes);
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
@@ -1608,6 +1676,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
+        InputPathTimer timed(InputPath::VertexZeroPadded, bytes);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -2319,6 +2388,152 @@ bool serveBindlessTables(const Context& context, Recorder& recorder, std::span<c
     return true;
 }
 
+}
+
+namespace {
+
+// Diagnostic (APS5_COMMIT_TRACE=<path>, APS5_COMMIT_TRACE_AT=<present> default 2000, APS5_COMMIT_TRACE_FRAMES=<n>
+// default 10): one line per queue-0 commit of n world frames (cost, draw/dispatch, render pass begun, address-based,
+// reads, read images, writes, written images and attachments) for the offline segmentation study (C52).
+struct CommitTraceRecord {
+    bool valid = false, dispatch = false, unknown = false, passBegun = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads, writes;
+    std::vector<VkImage> readImages, writtenImages;
+};
+
+struct CommitTrace {
+    std::mutex mutex;
+    std::string text;
+    std::uint64_t firstFrame = 0, lines = 0;
+    bool started = false, written = false;
+};
+
+CommitTrace& commitTrace() {
+    static CommitTrace trace;
+    return trace;
+}
+
+const char* CommitTracePath() {
+    static const char* path = std::getenv("APS5_COMMIT_TRACE");
+    return path;
+}
+
+CommitTraceRecord& pendingCommitTrace() {
+    static thread_local CommitTraceRecord record;
+    return record;
+}
+
+}
+
+void NoteCommitTracePassBegun() {
+    if (CommitTracePath() != nullptr) pendingCommitTrace().passBegun = true;
+}
+
+void FinishCommitTrace(std::uint64_t present, double costUs) {
+    if (CommitTracePath() == nullptr) return;
+    auto& record = pendingCommitTrace();
+    if (!record.valid) return;
+    record.valid = false;
+    static const std::uint64_t at = [] { const char* text = std::getenv("APS5_COMMIT_TRACE_AT"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 2000ull; }();
+    static const std::uint64_t frames = [] { const char* text = std::getenv("APS5_COMMIT_TRACE_FRAMES"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 10ull; }();
+    auto& trace = commitTrace();
+    std::lock_guard lock(trace.mutex);
+    if (trace.written || present < at) return;
+    if (!trace.started) {
+        trace.started = true;
+        trace.firstFrame = present;
+    }
+    if (present >= trace.firstFrame + frames) {
+        if (FILE* file = std::fopen(CommitTracePath(), "w")) {
+            std::fwrite(trace.text.data(), 1, trace.text.size(), file);
+            std::fclose(file);
+        }
+        std::fprintf(stderr, "[commit-trace] wrote %llu commits of %llu frames to %s\n", static_cast<unsigned long long>(trace.lines), static_cast<unsigned long long>(frames), CommitTracePath());
+        trace.written = true;
+        trace.text.clear();
+        trace.text.shrink_to_fit();
+        return;
+    }
+    char head[96];
+    std::snprintf(head, sizeof(head), "%llu %.2f %c %d %d R", static_cast<unsigned long long>(present - trace.firstFrame), costUs, record.dispatch ? 'X' : 'D', record.passBegun ? 1 : 0, record.unknown ? 1 : 0);
+    trace.text += head;
+    char item[64];
+    for (const auto& [begin, end] : record.reads) { std::snprintf(item, sizeof(item), " %llx-%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end)); trace.text += item; }
+    trace.text += " I";
+    for (const auto image : record.readImages) { std::snprintf(item, sizeof(item), " %llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image))); trace.text += item; }
+    trace.text += " W";
+    for (const auto& [begin, end] : record.writes) { std::snprintf(item, sizeof(item), " %llx-%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end)); trace.text += item; }
+    trace.text += " A";
+    for (const auto image : record.writtenImages) { std::snprintf(item, sizeof(item), " %llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(image))); trace.text += item; }
+    trace.text += '\n';
+    ++trace.lines;
+}
+
+void NoteCommitAccess(std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, std::span<const std::pair<VkImage, bool>> images, std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::pair<VkImage, bool>> attachments, bool unknown, bool dispatch) {
+    if (CommitTracePath() != nullptr) {
+        auto& record = pendingCommitTrace();
+        record.valid = true;
+        record.dispatch = dispatch;
+        record.unknown = unknown;
+        record.passBegun = false;
+        record.reads.assign(reads.begin(), reads.end());
+        record.writes.assign(writes.begin(), writes.end());
+        record.readImages.clear();
+        record.writtenImages.clear();
+        for (const auto& [image, written] : images) (written ? record.writtenImages : record.readImages).push_back(image);
+        for (const auto& [image, written] : attachments) record.writtenImages.push_back(image);
+    }
+    struct Entry {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        std::vector<VkImage> images;
+    };
+    constexpr std::size_t Window = 64;
+    static std::mutex mutex;
+    static std::array<Entry, Window> ring;
+    static std::size_t head = 0, filled = 0;
+    // Buckets by distance: 1, 2-3, 4-7, 8-15, 16-31, 32-64, none; per kind (0 draw, 1 dispatch).
+    static std::array<std::array<std::uint64_t, 7>, 2> distance{};
+    static std::array<std::uint64_t, 2> unknowns{}, commits{};
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    const auto kind = dispatch ? 1u : 0u;
+    ++commits[kind];
+    if (unknown) {
+        ++unknowns[kind];
+    } else {
+        std::size_t found = 0;
+        for (std::size_t back = 1; back <= filled && found == 0; ++back) {
+            const auto& entry = ring[(head + Window - back) % Window];
+            const bool rangeHit = std::any_of(reads.begin(), reads.end(), [&](const auto& read) {
+                return std::any_of(entry.writes.begin(), entry.writes.end(), [&](const auto& write) { return read.first < write.second && write.first < read.second; });
+            });
+            const bool imageHit = !rangeHit && std::any_of(images.begin(), images.end(), [&](const auto& image) { return std::find(entry.images.begin(), entry.images.end(), image.first) != entry.images.end(); });
+            if (rangeHit || imageHit) found = back;
+        }
+        const std::size_t bucket = found == 0 ? 6u : found == 1 ? 0u : found < 4 ? 1u : found < 8 ? 2u : found < 16 ? 3u : found < 32 ? 4u : 5u;
+        ++distance[kind][bucket];
+    }
+    auto& slot = ring[head];
+    slot.writes.assign(writes.begin(), writes.end());
+    slot.images.clear();
+    for (const auto& [image, written] : images) {
+        if (written) slot.images.push_back(image);
+    }
+    for (const auto& [image, written] : attachments) slot.images.push_back(image);
+    head = (head + 1) % Window;
+    filled = std::min(filled + 1, Window);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    const auto u = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    std::fprintf(stderr, "[commit-deps] (10 s) draws %llu: reads unknown %llu; nearest earlier commit (draw or dispatch) whose writes it reads, by distance: 1 %llu, 2-3 %llu, 4-7 %llu, 8-15 %llu, 16-31 %llu, 32-64 %llu, none within 64 %llu | dispatches %llu: unknown %llu; 1 %llu, 2-3 %llu, 4-7 %llu, 8-15 %llu, 16-31 %llu, 32-64 %llu, none %llu\n", u(commits[0]), u(unknowns[0]), u(distance[0][0]), u(distance[0][1]), u(distance[0][2]), u(distance[0][3]), u(distance[0][4]), u(distance[0][5]), u(distance[0][6]), u(commits[1]), u(unknowns[1]), u(distance[1][0]), u(distance[1][1]), u(distance[1][2]), u(distance[1][3]), u(distance[1][4]), u(distance[1][5]), u(distance[1][6]));
+    distance = {};
+    unknowns = {};
+    commits = {};
+}
+
+namespace {
+
 bool WriteOnlyPasses() {
     static const bool enabled = std::getenv("APS5_NO_WRITE_ONLY_PASSES") == nullptr;
     return enabled;
@@ -2408,6 +2623,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    static const bool commitDeps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (commitDeps) NoteCommitAccess(passReads, passImages, resources.GpuWrites(), passAttachments, addressBased || resources.UsesAddressTable(), false);
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
     static const bool passShapeCounts = std::getenv("APS5_PROFILE_GPU_ATTRIB") != nullptr;
     if (passShapeCounts) NotePassForced(capture, readsTarget, gpuIndirect, meshIndirect, record.blended != nullptr, heap);

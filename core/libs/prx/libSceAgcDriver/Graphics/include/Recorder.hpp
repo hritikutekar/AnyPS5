@@ -730,6 +730,11 @@ public:
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
+    // Diagnostic (APS5_PROFILE_GPU): each timed range as it is read back, and the GPU milliseconds per timed key
+    // (program or command class) inside a GPU time window, largest first (the [gpu-tail] attribution).
+    static void NoteTimedRange(std::uint64_t key, double startNs, double endNs);
+    static std::vector<std::pair<std::uint64_t, double>> TimedKeysInWindow(double fromNs, double toNs);
+    static std::string TimedKeyName(std::uint64_t key);
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);

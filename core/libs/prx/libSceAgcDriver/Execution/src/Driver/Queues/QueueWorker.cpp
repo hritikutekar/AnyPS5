@@ -11,6 +11,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include <chrono>
+#include <mutex>
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -130,6 +132,74 @@ void Driver::reapCompletionLabels() {
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
 }
 
+namespace {
+
+// Diagnostic (APS5_PROFILE_DRAW): for queue 0's submissions, whether each was enqueued before the previous
+// execute ended (and how long before) or after it (the worker waited with nothing queued); [q0-dequeue].
+struct Queue0Dequeues {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point lastEnd{}, lastEop{}, report = std::chrono::steady_clock::now();
+    std::uint64_t before = 0, after = 0, suspends = 0, eops = 0, afterEop = 0;
+    double beforeMs = 0, afterMs = 0, endToEopMs = 0, eopToEnqueueMs = 0;
+};
+
+Queue0Dequeues& queue0Dequeues() {
+    static Queue0Dequeues stats;
+    return stats;
+}
+
+bool queue0DequeuesProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+}
+
+// The flip's EOP interrupt of queue 0 delivered to the title (after the recorded work completed on the GPU).
+void NoteQueue0FlipEop() {
+    if (!queue0DequeuesProfiled()) return;
+    auto& stats = queue0Dequeues();
+    std::lock_guard lock(stats.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    stats.lastEop = now;
+    ++stats.eops;
+    if (stats.lastEnd != std::chrono::steady_clock::time_point{}) stats.endToEopMs += std::chrono::duration<double, std::milli>(now - stats.lastEnd).count();
+}
+
+namespace {
+
+void noteQueue0ExecuteEnd() {
+    if (!queue0DequeuesProfiled()) return;
+    auto& stats = queue0Dequeues();
+    std::lock_guard lock(stats.mutex);
+    stats.lastEnd = std::chrono::steady_clock::now();
+}
+
+void noteQueue0Dequeue(std::chrono::steady_clock::time_point enqueuedAt, bool suspend) {
+    if (!queue0DequeuesProfiled()) return;
+    auto& stats = queue0Dequeues();
+    std::lock_guard lock(stats.mutex);
+    if (suspend) ++stats.suspends;
+    if (stats.lastEnd != std::chrono::steady_clock::time_point{} && enqueuedAt != std::chrono::steady_clock::time_point{}) {
+        const auto ms = std::chrono::duration<double, std::milli>(enqueuedAt - stats.lastEnd).count();
+        if (ms <= 0) { ++stats.before; stats.beforeMs -= ms; } else { ++stats.after; stats.afterMs += ms; }
+        if (!suspend && stats.lastEop != std::chrono::steady_clock::time_point{}) {
+            ++stats.afterEop;
+            stats.eopToEnqueueMs += std::chrono::duration<double, std::milli>(enqueuedAt - stats.lastEop).count();
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.report < std::chrono::seconds(10)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[q0-dequeue] (10 s) submissions enqueued before the previous execute ended: %llu (avg %.1f ms before), after it: %llu (avg %.1f ms after, the worker waited with nothing queued); %llu suspend boundaries; flip EOPs %llu, avg %.1f ms after the execute ended; submissions enqueued avg %.1f ms after the latest flip EOP (%llu)\n",
+        static_cast<unsigned long long>(stats.before), stats.before ? stats.beforeMs / static_cast<double>(stats.before) : 0.0, static_cast<unsigned long long>(stats.after), stats.after ? stats.afterMs / static_cast<double>(stats.after) : 0.0, static_cast<unsigned long long>(stats.suspends),
+        static_cast<unsigned long long>(stats.eops), stats.eops ? stats.endToEopMs / static_cast<double>(stats.eops) : 0.0, stats.afterEop ? stats.eopToEnqueueMs / static_cast<double>(stats.afterEop) : 0.0, static_cast<unsigned long long>(stats.afterEop));
+    stats.before = stats.after = stats.suspends = stats.eops = stats.afterEop = 0;
+    stats.beforeMs = stats.afterMs = stats.endToEopMs = stats.eopToEnqueueMs = 0;
+    stats.report = now;
+}
+
+}
+
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
     char role[32];
@@ -238,6 +308,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 submission = std::move(pending.front());
                 pending.pop_front();
+                if (id == 0) noteQueue0Dequeue(submission.enqueuedAt, submission.suspend);
                 if (APS5_ENABLE_TIMING_LOG) submission.dequeuedAt = std::chrono::steady_clock::now();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
                 if (submission.waitFree) {
@@ -262,6 +333,8 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             execute(submission);
+            if (id == 0) noteQueue0ExecuteEnd();
+            if (id == 0) DrawPipeline::WorkerActivity().store(static_cast<std::uint8_t>(DrawPipeline::WorkerState::BetweenSubmissions), std::memory_order_relaxed);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());

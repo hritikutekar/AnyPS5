@@ -2880,6 +2880,52 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     timingClassMs += nanoseconds / 1e6;
 }
 
+namespace {
+
+// Diagnostic ring of the latest timed GPU ranges (APS5_PROFILE_GPU), for Recorder::TimedKeysInWindow.
+struct TimedRangeRing {
+    struct Entry { std::uint64_t key = 0; double startNs = 0, endNs = 0; };
+    std::mutex mutex;
+    std::vector<Entry> entries = std::vector<Entry>(1u << 17);
+    std::size_t cursor = 0;
+};
+
+TimedRangeRing& timedRangeRing() {
+    static TimedRangeRing ring;
+    return ring;
+}
+
+}
+
+void Recorder::NoteTimedRange(std::uint64_t key, double startNs, double endNs) {
+    auto& ring = timedRangeRing();
+    std::lock_guard lock(ring.mutex);
+    ring.entries[ring.cursor++ % ring.entries.size()] = {key, startNs, endNs};
+}
+
+std::vector<std::pair<std::uint64_t, double>> Recorder::TimedKeysInWindow(double fromNs, double toNs) {
+    std::map<std::uint64_t, double> byKey;
+    auto& ring = timedRangeRing();
+    {
+        std::lock_guard lock(ring.mutex);
+        for (const auto& entry : ring.entries) {
+            const auto from = std::max(entry.startNs, fromNs);
+            const auto to = std::min(entry.endNs, toNs);
+            if (to > from && entry.endNs > entry.startNs) byKey[entry.key] += (to - from) / 1e6;
+        }
+    }
+    std::vector<std::pair<std::uint64_t, double>> sorted(byKey.begin(), byKey.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    return sorted;
+}
+
+std::string Recorder::TimedKeyName(std::uint64_t key) {
+    char text[48];
+    if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(text, sizeof(text), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+    else std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(key));
+    return text;
+}
+
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
@@ -3619,6 +3665,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+        NoteTimedRange(key, static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period);
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;
