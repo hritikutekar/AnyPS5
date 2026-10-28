@@ -339,6 +339,11 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // Whether the storage snapshot held for the range is stale only through the driver's stamps (GPU writes, its own
+    // in-order stores), with no CPU store collected since: the caller collected the range first. Then the draw binds the
+    // range in place (its reads are noted pending, so a CPU-side store over them waits or goes to the GPU in order) and
+    // the snapshot is left as it is, neither refreshed nor dropped.
+    bool DrawSnapshotGpuWrittenOnly(std::uint64_t address, std::size_t bytes) const;
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;

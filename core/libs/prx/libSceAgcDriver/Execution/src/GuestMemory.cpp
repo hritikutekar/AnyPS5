@@ -38,6 +38,9 @@
 #include <fcntl.h>
 #include <fstream>
 #include <link.h>
+#include <dlfcn.h>
+#include <map>
+#include <pthread.h>
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
@@ -1852,7 +1855,39 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+namespace {
+// Diagnostic: APS5_TRACE_MARK_ADDR=<hex> counts the MarkWritten calls whose range holds that address by caller (offset
+// in this library, for addr2line) and thread; [mark-trace] every 10 s.
+void traceMarkWritten(std::uint64_t address, std::size_t bytes, const void* caller) {
+    static const std::uint64_t traced = [] {
+        const char* text = std::getenv("APS5_TRACE_MARK_ADDR");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : std::uint64_t{0};
+    }();
+    if (traced == 0 || traced < address || traced >= address + bytes) return;
+    Dl_info info{};
+    const auto offset = dladdr(caller, &info) != 0 ? reinterpret_cast<std::uintptr_t>(caller) - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : reinterpret_cast<std::uintptr_t>(caller);
+    char thread[16] = {};
+    pthread_getname_np(pthread_self(), thread, sizeof(thread));
+    static std::mutex traceMutex;
+    static std::map<std::tuple<std::uintptr_t, std::string, std::uint64_t, std::size_t>, std::uint64_t> calls;
+    static auto report = std::chrono::steady_clock::now();
+    std::lock_guard traceLock(traceMutex);
+    ++calls[{offset, thread, address, bytes}];
+    if (std::chrono::steady_clock::now() - report < std::chrono::seconds(10)) return;
+    report = std::chrono::steady_clock::now();
+    std::string line;
+    for (const auto& [key, count] : calls) {
+        char item[160];
+        std::snprintf(item, sizeof(item), "\n  caller +0x%zx thread %s range 0x%llx+%zu: %llu", static_cast<std::size_t>(std::get<0>(key)), std::get<1>(key).c_str(), static_cast<unsigned long long>(std::get<2>(key)), std::get<3>(key), static_cast<unsigned long long>(count));
+        line += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[mark-trace] (10 s) 0x%llx:%s\n", static_cast<unsigned long long>(traced), line.c_str());
+    calls.clear();
+}
+}
+
+__attribute__((noinline)) std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    traceMarkWritten(address, bytes, __builtin_return_address(0));
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
