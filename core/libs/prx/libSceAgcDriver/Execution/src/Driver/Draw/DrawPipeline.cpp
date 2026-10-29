@@ -271,12 +271,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     for (int shown = 0; shown < 5; ++shown) {
         const auto top = std::max_element(drainOpcodes.begin(), drainOpcodes.begin() + 0x100);
         if (*top == 0) break;
-        char item[32];
-        std::snprintf(item, sizeof(item), " 0x%02x x%llu", static_cast<unsigned>(top - drainOpcodes.begin()), static_cast<unsigned long long>(*top));
+        char item[48];
+        const auto index = static_cast<std::size_t>(top - drainOpcodes.begin());
+        std::snprintf(item, sizeof(item), " 0x%02x x%llu (%.1f ms)", static_cast<unsigned>(index), static_cast<unsigned long long>(*top), static_cast<double>(drainOpcodeNs[index]) / 1e6);
         drainText += item;
         *top = 0;
     }
     drainOpcodes = {};
+    drainOpcodeNs = {};
     if (!drainSites.empty()) {
         drainText += "; drains by site:";
         for (const auto& [name, site] : drainSites) {
@@ -455,6 +457,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, std::source_l
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     const auto waitedNs = elapsedNs(start);
+    drainOpcodeNs[std::min<std::uint32_t>(opcode, 0x100)] += waitedNs;
     drainWaitNs[index] += waitedNs;
     {
         const char* file = where.file_name();

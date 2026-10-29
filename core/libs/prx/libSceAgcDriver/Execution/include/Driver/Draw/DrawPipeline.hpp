@@ -178,6 +178,7 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
+    std::array<std::uint64_t, 257> drainOpcodeNs{};
     // Diagnostic: drains other than packet drains by the call site that asked for them (file:line).
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drainSites;
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
