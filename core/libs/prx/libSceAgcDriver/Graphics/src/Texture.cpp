@@ -38,6 +38,7 @@
 #include <atomic>
 #include <mutex>
 #include <map>
+#include <pthread.h>
 #include <memory>
 #include <unordered_map>
 #include <limits>
@@ -4200,7 +4201,11 @@ void StorageTexture::refreshGeneration() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
-    if (storageTraced(descriptor.baseAddress, guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu pending %p 0x%llx units %u+%u (was pending %d)\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), first, count, first < layerPending.size() && layerPending[first] ? 1 : 0);
+    if (storageTraced(descriptor.baseAddress, guestBytes)) {
+        char thread[16] = {};
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        std::fprintf(stderr, "[storage-trace] present %llu pending %p 0x%llx units %u+%u (was pending %d) thread %s lane %u\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), first, count, first < layerPending.size() && layerPending[first] ? 1 : 0, thread, static_cast<unsigned>(Recorder::ThreadLane()));
+    }
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -5989,10 +5994,17 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
     };
     bool unsavedOutsideWatch = false;
+    // C75: a small level whose elements end inside its block (elementExtent < guestBytes, precise small overlap) stores,
+    // and judges what was stored over it, by its elements only. Its block reaches into the next level packed behind it,
+    // whose own store stamped the shared 64 KiB block and fell inside the tile: StoredOver then said "overwritten", the
+    // level skipped its results at every write-back and re-uploaded stale bytes (the title menu's reflection-probe mips:
+    // the katana bleached white, the world's hair and wood too). APS5_NO_ELEMENT_EXTENT_WRITEBACK=1 (runtime switch)
+    // judges and stores the whole block as before.
+    const bool elementsOnly = elementExtent < guestBytes && !RuntimeSwitches::Set(RuntimeSwitch::NoElementExtentWriteBack);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
         const auto begin = layerBegin(layer);
-        const auto end = begin + layerBytes(layer);
+        const auto end = begin + (elementsOnly ? std::min<std::uint64_t>(elementExtent, layerBytes(layer)) : layerBytes(layer));
         if (tracked ? layerGeneration[layer] == 0 : !compared[layer]) {
             unsavedOutsideWatch = unsavedOutsideWatch || !tracked;
             keep.emplace_back(begin, end);
