@@ -1661,17 +1661,25 @@ namespace {
 // Diagnostic: APS5_TRACE_STORAGE_RANGE=<hex begin>-<hex end> prints [storage-trace] lines for every storage image whose
 // guest bytes overlap the range: creation (shape, levels, layers, bytes, element extent), each markLayersPending, each
 // write-back (stored ranges), each Refresh outcome, with the present number. Capped at 3000 lines.
-bool storageTraced(std::uint64_t begin, std::uint64_t bytes) {
-    static const std::pair<std::uint64_t, std::uint64_t> range = [] {
+// <begin>-<end>@<present> traces from that present on (creations always, under their own cap).
+bool storageTraced(std::uint64_t begin, std::uint64_t bytes, bool creation = false) {
+    struct Range {
+        std::uint64_t from = 0, to = 0, present = 0;
+    };
+    static const Range range = [] {
+        Range parsed;
         const char* text = std::getenv("APS5_TRACE_STORAGE_RANGE");
-        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        if (text == nullptr) return parsed;
         char* end = nullptr;
-        const auto from = std::strtoull(text, &end, 16);
-        const auto to = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
-        return std::pair<std::uint64_t, std::uint64_t>{from, to};
+        parsed.from = std::strtoull(text, &end, 16);
+        if (end != nullptr && *end == '-') parsed.to = std::strtoull(end + 1, &end, 16);
+        if (end != nullptr && *end == '@') parsed.present = std::strtoull(end + 1, nullptr, 10);
+        return parsed;
     }();
-    if (range.second <= range.first || begin >= range.second || begin + bytes <= range.first) return false;
-    static std::atomic<int> lines{0};
+    if (range.to <= range.from || begin >= range.to || begin + bytes <= range.from) return false;
+    static std::atomic<int> lines{0}, creations{0};
+    if (creation) return creations.fetch_add(1, std::memory_order_relaxed) < 3000;
+    if (Recorder::Presents() < range.present) return false;
     return lines.fetch_add(1, std::memory_order_relaxed) < 3000;
 }
 }
@@ -1693,7 +1701,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
         elementExtent = SmallImageElementExtent(descriptor, geometry, elementBytes);
-        if (storageTraced(descriptor.baseAddress, geometry.guestBytes)) std::fprintf(stderr, "[storage-trace] present %llu create %p 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (mip %u) layers %u extent 0x%llx\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(geometry.guestBytes), descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, mipLevel, geometry.layers, static_cast<unsigned long long>(elementExtent));
+        if (storageTraced(descriptor.baseAddress, geometry.guestBytes, true)) std::fprintf(stderr, "[storage-trace] present %llu create %p 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u (mip %u) layers %u extent 0x%llx\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<const void*>(this), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(geometry.guestBytes), descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, mipLevel, geometry.layers, static_cast<unsigned long long>(elementExtent));
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
