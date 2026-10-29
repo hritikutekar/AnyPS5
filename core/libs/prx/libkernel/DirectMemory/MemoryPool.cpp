@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -309,7 +311,11 @@ private:
 
 int DirectMemoryAlloc(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, int memoryType, int64_t* physOut) {
     try {
-        return PhysicalMemoryPool::Instance().Alloc(searchStart, searchEnd, len, alignment, memoryType, physOut);
+        const int result = PhysicalMemoryPool::Instance().Alloc(searchStart, searchEnd, len, alignment, memoryType, physOut);
+        // APS5_TRACE_MEMORY: the memory type of each direct allocation (the "map direct" lines name the phys offset).
+        static const bool trace = std::getenv("APS5_TRACE_MEMORY") != nullptr;
+        if (trace && result == 0 && physOut != nullptr) std::fprintf(stderr, "[memory] alloc direct phys=0x%llx+0x%zx type=%d\n", static_cast<unsigned long long>(*physOut), len, memoryType);
+        return result;
     } catch (const std::bad_alloc&) {
         return SCE_KERNEL_ERROR_ENOMEM;
     }
