@@ -25,6 +25,7 @@ public:
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
+    void SetNativeF16Fma(bool enabled) { nativeF16Fma = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
@@ -381,6 +382,8 @@ private:
     RoundingState rounding;
     bool ieeeMode = false;
     bool nativeFloat16 = false;
+    // SpirvTarget::nativeF16Fma (with nativeFloat16).
+    bool nativeF16Fma = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

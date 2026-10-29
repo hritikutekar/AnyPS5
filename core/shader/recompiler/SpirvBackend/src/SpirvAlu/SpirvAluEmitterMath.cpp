@@ -1527,6 +1527,12 @@ std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::u
     return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, product));
 }
 
+std::uint32_t EmitFPFma16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    const auto f16x2 = TypeF16x2(state);
+    const auto fused = EmitExt(state, f16x2, GLSLstd450Fma, {Unary(state, spv::OpBitcast, f16x2, arg0), Unary(state, spv::OpBitcast, f16x2, arg1), Unary(state, spv::OpBitcast, f16x2, arg2)});
+    return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, fused));
+}
+
 std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
     if (NativeF16Rte(state)) return EmitNativeF32ToF16BitsRte(state, value);
     const auto u32 = TypeU32(state);

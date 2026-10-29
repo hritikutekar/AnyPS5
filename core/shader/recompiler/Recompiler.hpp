@@ -321,6 +321,9 @@ struct SpirvTarget {
     // v_fma_mix* in mode 0 as one fused f32 Fma whose result the f16 write rounds again (an AMD host:
     // the driver sets it, APS5_NO_NATIVE_MIX=1 clears it). Off: the exact round-to-odd path above.
     bool nativeMixF16 = false;
+    // f16 FMA (v_fma_f16, v_pk_fma_f16) as a native f16 Fma, and packed native f16 results without the per-lane
+    // NaN fix-ups (an AMD host computes them in hardware: the driver sets it, APS5_NO_NATIVE_F16_FMA=1 clears it).
+    bool nativeF16Fma = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;

@@ -4168,6 +4168,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.fusedFma = state->fusedFma;
     // v_fma_mix* as a fused f32 Fma on AMD hosts (SpirvTarget::nativeMixF16); APS5_NO_NATIVE_MIX=1 keeps the exact path.
     target.nativeMixF16 = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_MIX") == nullptr;
+    // f16 FMA and packed f16 NaN results in hardware on AMD hosts (SpirvTarget::nativeF16Fma); APS5_NO_NATIVE_F16_FMA=1 off.
+    target.nativeF16Fma = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_F16_FMA") == nullptr;
     target.float16DenormPreserve = state->float16DenormPreserve;
     target.bindlessImages = state->bindlessImages;
     target.spannedWaves = state->spannedWaves;

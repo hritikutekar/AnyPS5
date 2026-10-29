@@ -59,14 +59,24 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return sourceBits[index][lane];
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, sourceLaneBits(0u, high), sourceLaneBits(1u, high)); };
-    const bool native = nativeFloat16 && !flushResults && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32);
+    // SpirvTarget::nativeF16Fma: v_pk_fma_f16 as a native f16 Fma (one rounding, as the hardware), and the native
+    // results keep the host's NaN results instead of the per-lane fix-ups below (an AMD host computes them alike).
+    const bool fusedThird = opcode == IrOpcode::FPFma32 && (accumulator || inst.sourceCount == 3u);
+    const bool hardware = nativeF16Fma && !quietSnan && !fp16Overflow() && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || fusedThird);
+    const bool native = nativeFloat16 && !flushResults && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || (hardware && fusedThird));
     const auto nativeResult = [&]() {
         const IrU32 lhs = packU16Lanes(sourceLaneBits(0u, false), sourceLaneBits(0u, true));
         const IrU32 rhs = packU16Lanes(sourceLaneBits(1u, false), sourceLaneBits(1u, true));
+        if (opcode == IrOpcode::FPFma32) {
+            const IrU32 third = packU16Lanes(sourceLaneBits(2u, false), sourceLaneBits(2u, true));
+            return IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &third.Value()}));
+        }
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
-    if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
+    if (native && hardware) {
+        if (inst.destination.clamp) result = packU16Lanes(clampF16Bits(inst.destination, IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)))), clampF16Bits(inst.destination, IrU32(ir.ShiftRightLogical(result.Value(), ir.Constant(16u)))));
+    } else if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
         };
@@ -278,6 +288,15 @@ bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode op
         }
         const IrF32 value = readF16AsF32(operand);
         args[index] = measured ? &flushF16InputValue(value).Value() : &value.Value();
+    }
+    if (opcode == IrOpcode::FPFma32 && !mix && nativeF16Fma && nativeFloat16Mode() && !fp16Overflow() && inst.destination.omod == 0u) {
+        // SpirvTarget::nativeF16Fma: v_fma_f16 as a native f16 Fma (one rounding, as the hardware).
+        const IrU32 lhs = readF16Bits(sourceAt(inst, 0u));
+        const IrU32 rhs = readF16Bits(sourceAt(inst, 1u));
+        const IrU32 addend = readF16Bits(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+        const IrU32 fused(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+        write16Bits(inst.destination, clampF16Bits(inst.destination, IrU32(ir.BitwiseAnd(fused.Value(), ir.Constant(0xffffu)))));
+        return true;
     }
     if (opcode == IrOpcode::FPFma32 && !mix) {
         IrF32 result = fmaF16RoundedToOdd(IrF32(*args[0]), IrF32(*args[1]), IrF32(*args[2]));
