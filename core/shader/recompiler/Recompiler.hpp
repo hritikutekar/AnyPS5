@@ -318,6 +318,9 @@ struct SpirvTarget {
     // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
     // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
     bool fusedFma = false;
+    // v_fma_mix* in mode 0 as one fused f32 Fma whose result the f16 write rounds again (an AMD host:
+    // the driver sets it, APS5_NO_NATIVE_MIX=1 clears it). Off: the exact round-to-odd path above.
+    bool nativeMixF16 = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;

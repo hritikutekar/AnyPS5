@@ -1055,6 +1055,11 @@ std::uint32_t InterpolateF16Fast(SpirvEmitterState& state, std::uint32_t a, std:
 
 std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode) {
     static const bool f64Only = std::getenv("APS5_NO_MIX_F32") != nullptr;
+    // SpirvTarget::nativeMixF16: one fused f32 Fma, rounded to f16 again by the write (it can differ from the exact
+    // single rounding by one f16 ulp where the f32 result lands on an f16 midpoint). The exact path below costs ~30
+    // instructions and an inlined f64 fallback per v_fma_mix; on 0x80003ae600 (the title menu's costliest dispatch)
+    // the shader goes from 25,872 to 12,015 instructions (RADV estimate 90,029 -> 21,381 cycles per wave).
+    if (state.nativeMixF16 && mode->ImmediateU32() == 0u) return Glsl(state, TypeF32(state), GLSLstd450Fma, arg0, arg1, arg2);
     if (state.fusedFma && !f64Only && mode->ImmediateU32() == 0u) return InterpolateF16Fast(state, arg0, arg1, arg2);
     return CallInterpolate(state, arg0, arg1, arg2, true, mode->ImmediateU32());
 }

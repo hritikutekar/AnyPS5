@@ -651,6 +651,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.bindlessImages = request.target.bindlessImages;
     targetOptions.programAddress = request.shader.codeAddress;
     targetOptions.fusedFma = request.target.fusedFma;
+    targetOptions.nativeMixF16 = request.target.nativeMixF16;
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.float32FlushToZero = request.target.float32FlushToZero;

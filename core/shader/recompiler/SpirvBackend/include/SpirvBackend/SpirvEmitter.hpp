@@ -33,6 +33,7 @@ struct SpirvTargetOptions {
     // Faulting reads continue with zero in wave-operation programs (the older fix) instead of stopping the invocation.
     bool bdaContinueWaveOperations = false;
     bool fusedFma = false;
+    bool nativeMixF16 = false;
     // ShaderComputeStageInfo::singleWorkgroup of the request.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
