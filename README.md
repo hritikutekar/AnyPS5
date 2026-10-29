@@ -129,7 +129,9 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
     write-back (`168f565bb`): **+1.4 %** (`APS5_NO_INCREMENTAL_SHADOW_COUNT=1` off).
   - Surfaces whose DCC keys are all "single" are expanded on the GPU in the open batch instead of read, expanded and
     waited for on the CPU (`3a43c5980`): **+5.2 %** (`APS5_NO_GPU_SINGLE_EXPAND=1` off).
-  - Title menu altogether: about 7 fps on 10-26, 10.2 fps on 10-28 (best335), 12.3 fps now (the world moved little:
+  - Precise small overlap on by default now that its colour bug is fixed (`127156504`): **+5.1 %** at the menu
+    (back-to-back runs, 121.6 -> 127.8 presents per 10 s), the world unchanged.
+  - Title menu altogether: about 7 fps on 10-26, 10.2 fps on 10-28 (best335), 12.3 fps on 10-29 (the world moved little:
     it waits on its GPU tail and on cross-queue work as much as on the committer).
 - The second Vulkan queue (`APS5_ASYNC_LANE=51`) runs on RADV's compute family (RADV's graphics family has one queue).
 - Texture-cache frame age counts seconds only once presents stand still for 10 s (`APS5_NO_PRESENT_FRAME_AGE=1` off).
@@ -160,14 +162,15 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
    VK_ICD_FILENAMES=<mesa>/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json
    APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1 APS5_STAGING_DIFF=1
    APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1 APS5_ASYNC_LANE=51
-   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200 APS5_NO_PRECISE_SMALL_OVERLAP=1
+   APS5_DEFER_REFRESH_FLUSH=1 APS5_BDA_CONTINUE=800029c200
    APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_STAGING_POOL_MIB=512
    APS5_PIPELINE_DISPATCH=1 APS5_PIPELINE_DISPATCH_MISSES=1 APS5_DISPATCH_ITEM_BDA_WRITES=1
    LD_PRELOAD=/usr/lib/libjemalloc.so.2
    ```
    `APS5_RESOURCE_CACHE_ENTRIES=1024` matters: without it the resource cache's adaptive capacity often grows to 4096 in
    the world load, keeps ~2.3 GiB more staging in VRAM and the world runs at about a third of the speed.
-   `APS5_NO_PRECISE_SMALL_OVERLAP=1` keeps the world's colours right (white hair and bleached wood without it).
+   `APS5_NO_PRECISE_SMALL_OVERLAP=1` is no longer needed: its colour bug (white hair, bleached wood, a white katana on
+   the title menu) is fixed in `127156504`, and leaving it out is about 5 % faster at the menu.
    jemalloc comes with most distributions (`jemalloc` package); the path may differ. Over a 27-minute run with it the
    process memory in the world stayed flat (about 3 GB resident; the peak, ~23 GB, is during the world load).
 4. Optional, +13 % in the world here: shahulmubeen-a's 1080p relinker patch for 02.002.000 (output 3840x2160 ->
@@ -186,9 +189,10 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 - About 1 boot in 8 crashes around presents 550-605 ("unsupported PM4 packet type", invalid command-buffer cursors or a
   SIGSEGV): the title's main thread and a JobWorker thread append to one global compute command buffer at the same
   time (`APS5_TRACE_CB_RACE=1` shows it). Not fixed; restart the game when it happens.
-- Colours need `APS5_NO_PRECISE_SMALL_OVERLAP=1`: without it the reflection probe's per-frame GPU results are never
-  stored, so reflections bleach (the katana on the title menu, hair and wood in the world). The workaround costs about
-  4 % at the menu; the reader that misses those results isn't found yet.
+- Fixed 2026-10-29 (`127156504`): the bleached colours that `APS5_NO_PRECISE_SMALL_OVERLAP=1` used to hide. The
+  reflection probe's small HDR levels sit packed in one 64 KiB stamp block; at each flip the larger level stored first,
+  and the smaller ones judged their whole 4 KiB tile "stored over" by it and dropped their own results, so the probe
+  never updated. They now judge and store by their elements only (`APS5_NO_ELEMENT_EXTENT_WRITEBACK=1` reverts).
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
 - Shader `0x80001df900` (clustered-lighting compute pass, 747,518 SPIR-V words) used to hang or fault and was skipped;
   with the ACO LDS spill fix it compiles (about 39 s cold) and runs in the world without faults, so it is no longer skipped.
