@@ -2400,6 +2400,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
     static thread_local bool flushing = false;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     if (flushing || !overlapsStalePlane(address, end)) return {};
+    NoteDepthPlaneFlushCaller(__builtin_return_address(0));
     flushing = true;
     struct Reset {
         ~Reset() { flushing = false; }

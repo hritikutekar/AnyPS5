@@ -2383,12 +2383,32 @@ void NoteRefreshOutcome(bool flushed, bool borrowed, const char* aliasRejected, 
 
 // APS5_PROFILE_DRAW: FlushPending's waits for the pending writer by flush reason, wait kind and why
 // it was not deferred, as a [flush-wait] line every 10 s (most waited first).
+namespace {
+
+// The caller of this thread's FlushDepthPlanes and the reason of the FlushPending around it, if any
+// (APS5_PROFILE_DRAW: [flush-wait] names a "depth plane store" wait by them).
+thread_local const void* depthPlaneCaller = nullptr;
+thread_local const char* depthPlaneOuterReason = nullptr;
+
+} // namespace
+
+void NoteDepthPlaneFlushCaller(const void* caller) {
+    depthPlaneCaller = caller;
+}
+
 void NoteFlushWait(const char* reason, const char* kind, const char* why, double ms) {
+    std::string via;
+    if (reason != nullptr && std::strcmp(reason, "depth plane store") == 0) {
+        char text[96];
+        if (depthPlaneOuterReason != nullptr) std::snprintf(text, sizeof(text), " (in a flush for %s)", depthPlaneOuterReason);
+        else std::snprintf(text, sizeof(text), " (from +0x%llx)", GuestMemory::CodeOffset(depthPlaneCaller));
+        via = text;
+    }
     static std::mutex mutex;
     static std::map<std::string, std::pair<std::uint64_t, double>> waits;
     static auto lastReport = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex);
-    auto& slot = waits[std::string(reason != nullptr ? reason : "?") + " / " + kind + " / " + why];
+    auto& slot = waits[std::string(reason != nullptr ? reason : "?") + via + " / " + kind + " / " + why];
     ++slot.first;
     slot.second += ms;
     const auto now = std::chrono::steady_clock::now();
@@ -4313,7 +4333,14 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
-    static_cast<void>(FlushDepthPlanes(address, bytes));
+    {
+        const auto outer = std::exchange(depthPlaneOuterReason, reason);
+        struct Restore {
+            const char* value;
+            ~Restore() { depthPlaneOuterReason = value; }
+        } restore{outer};
+        static_cast<void>(FlushDepthPlanes(address, bytes));
+    }
     if (published != nullptr) *published = false;
     const auto nothingToStore = [&] {
         auto& pending = Pending();

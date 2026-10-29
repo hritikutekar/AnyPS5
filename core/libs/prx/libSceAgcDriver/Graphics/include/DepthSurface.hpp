@@ -28,6 +28,9 @@ std::size_t HtileStoreBackWaits(const Context& context, const DepthTarget& targe
 void NoteHtileWriter(std::uint64_t program, std::uint64_t htileAddress);
 bool HtileWriterProgram(std::uint64_t program);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes);
+// APS5_PROFILE_DRAW: the caller of the FlushDepthPlanes the calling thread runs, for the [flush-wait] line's
+// "depth plane store" waits (named by the enclosing flush's reason, or by the caller's module offset).
+void NoteDepthPlaneFlushCaller(const void* caller);
 bool DepthPlanesStale();
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
