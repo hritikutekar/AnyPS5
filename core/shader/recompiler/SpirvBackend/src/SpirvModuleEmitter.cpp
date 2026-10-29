@@ -1512,6 +1512,12 @@ void EmitF16DenormPreserve(SpirvEmitterState& state) {
     state.module.EmitCapability(spv::CapabilityDenormPreserve);
     state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 16u);
     state.f16DenormPreserveEmitted = true;
+    // A device whose 16- and 64-bit float controls are not independent (32_BIT_ONLY) takes one mode for both:
+    // the driver then keeps f16 denormals only with f64 ones (float64DenormPreserve), declared alike here.
+    if (state.float64DenormPreserve && !state.f64DenormPreserveEmitted) {
+        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 64u);
+        state.f64DenormPreserveEmitted = true;
+    }
 }
 
 static std::uint32_t UnpackF16BitsToF32(SpirvEmitterState& state, std::uint32_t bits, bool nanBits) {
