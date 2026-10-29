@@ -7,12 +7,12 @@
 > A work-in-progress test branch, not upstream code: `yotei/best` (Windows) plus the fixes it needs on Linux/RADV,
 > a Mesa patch, and diagnostics. Nothing here has been reviewed upstream.
 
-## Where it stands (2026-10-25)
+## Where it stands (2026-10-29)
 
 | | |
 |---|---|
 | **Furthest point** | Open world (loads from the title screen's Continue) |
-| **Frame rate** | open world about **1.6 fps** at the village gate: 16.2 presents per 10 s without the driver's profiling (run best191), 15.7 with it over 20 minutes (best189), on `da11e77de` with the environment below and the 1080p game patch; was about 0.7 fps on 2026-10-20, 1.13 fps on 2026-10-23 and 1.3 fps on 2026-10-24 |
+| **Frame rate** | title menu about **12.3 fps** (122.7 presents per 10 s, run best446; GPU clock forced high) and open world about **2.2 fps** at the village gate (~22 presents per 10 s, best447/best476), both with the driver's profiling on, the environment below, the 1080p game patch and an opt-in PGO build of the driver; the last unprofiled world figure was 1.95 fps (2026-10-27, `6ff7f14f0`). The world was about 0.7 fps on 2026-10-20, 1.13 on 10-23, 1.6 on 10-25 |
 | **Base** | Celegans12's `yotei/best` 233fff3f6 (upstream `main` 2026-10-21, draw-ahead #6188 off by default) |
 | **Needs** | Mesa 26.2.4 with [our ACO patch](docs/yotei-linux/mesa-26.2.4-aco-spill-fixes.patch); without it the GPU faults while the world loads |
 | **Tested on** | CachyOS, kernel 7.2.9, AMD RX 9070 XT (RDNA4, gfx1201), RADV, 32 GB RAM + swap, GCC, Release |
@@ -96,12 +96,52 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
     10 s, restart legs best179/best181 vs best180). The comparison was against glibc with
     `GLIBC_TUNABLES=glibc.malloc.arena_max=4:glibc.malloc.mmap_threshold=131072`, under which ~10 % of queue 0's worker
     sat in malloc's slow path; against glibc's defaults the gain may be smaller (not measured).
+- Performance, 2026-10-26/27 (in-run A/Bs where the change switches at runtime, otherwise alternating runs):
+  - Address-based (BDA) draws build stage A on the preparer from the cached address space (`c2a0742a2`): **+3.6 %**,
+    confirmed **+2.7 %**; address-based dispatches the same without the lock (`868e576b1`): **+2.0 %**; the preparer
+    prepares queue 0's dispatch items ahead of the committer (`f615ab17d`): **+1.3 %**.
+  - Address-based builds skip the space write scan when nothing could complete (`3b51693a3`): **+2.1 %**; merged BDA
+    tables are looked up by (space, build key) instead of hashing ~9,400 ranges (`761c97b54`): **+1.4 %**; the dispatch
+    cache holds 2,048 entries by default (`b8452391b`): **+1.8 %**.
+  - Build and system (Linux, GCC/Clang only; driver library only, the shader cache stays valid): `-march` + LTO for
+    `libSceAgcDriver` by default (`ANYPS5_AGC_NATIVE=OFF` for a portable build; FMA contraction stays off): **+3.2 %**;
+    queue 0's worker, the draw committer and the preparer pinned to their own physical cores (non-hybrid CPUs with at
+    least 6 cores, `APS5_NO_THREAD_PINNING=1` off): **+2.1 %**; opt-in PGO (`-DANYPS5_AGC_PGO=generate`, play until
+    present 2600, the driver writes the profile; then `-DANYPS5_AGC_PGO=use`): **+5.5 %**, goes stale when hot code
+    changes, so it is off by default.
+- Performance, 2026-10-27 to 10-29, title menu (each an in-run A/B with a runtime switch, plus a menu-hold run with
+  frame dumps every 2 presents: 0 of 1,350 frames banded, zero faults; the open world checked after each batch):
+  - The clamped copy of an index buffer is reused while its memory is unchanged: **+11.9 %**
+    (`APS5_NO_INDEX_CLAMP_MEMO=1` off); a DMA copy whose source has pending GPU writes runs on the GPU in queue order
+    instead of a CPU read-back, and immediate-data DMAs into the GDS are GPU fills: **+4.0 %**
+    (`APS5_NO_DMA_COPY_BEHIND_WRITES=1`, `APS5_NO_GDS_GPU_FILL=1` off) (`8bd5a14e0`).
+  - The reflection-probe array's slice copies accept the shared edge block whose surface bytes still hash the same, so
+    the 8.8 MiB probe is no longer re-snapshotted on the CPU every frame (`e5c577489`): **+5.4 %**
+    (`APS5_NO_SLICE_EDGE_HASH=1` off).
+  - Snapshots of a constant DCC clear are reused instead of filled and uploaded again (`19cfde3da`): **+3.3 %**
+    (`APS5_NO_CLEAR_SNAPSHOT_REUSE=1` off).
+  - The zero-fetch index clamp of a GPU-written 32 MiB index buffer runs on the GPU (`7a006364c`): **+3.4 %**
+    (`APS5_NO_GPU_INDEX_CLAMP=1` off); its CPU scan for the highest index is skipped while only GPU writes changed it
+    (`42465b0a9`, `e05cad75d`): **+1.5 %** (`APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE=1` off).
+  - Storage ranges only GPU work rewrote are read in place by draws instead of compared and patched every frame
+    (`6c40991ac`, `9c06f4ea0`): **+0.3 %** and **+1.6 %** (`APS5_NO_GPU_WRITTEN_IN_PLACE=1`, `APS5_NO_MOVED_IN_PLACE=1` off).
+  - The unit shadow keeps its live count incrementally instead of walking every 64 KiB unit of the import after each
+    write-back (`168f565bb`): **+1.4 %** (`APS5_NO_INCREMENTAL_SHADOW_COUNT=1` off).
+  - Surfaces whose DCC keys are all "single" are expanded on the GPU in the open batch instead of read, expanded and
+    waited for on the CPU (`3a43c5980`): **+5.2 %** (`APS5_NO_GPU_SINGLE_EXPAND=1` off).
+  - Title menu altogether: about 7 fps on 10-26, 10.2 fps on 10-28 (best335), 12.3 fps now (the world moved little:
+    it waits on its GPU tail and on cross-queue work as much as on the committer).
 - The second Vulkan queue (`APS5_ASYNC_LANE=51`) runs on RADV's compute family (RADV's graphics family has one queue).
 - Texture-cache frame age counts seconds only once presents stand still for 10 s (`APS5_NO_PRESENT_FRAME_AGE=1` off).
 - Driver threads are named on Linux (`agc q0x0`, `agc commit`, …) for `top -H` and `perf`.
 - Controllers without a touchpad: hold View and move the right stick to swipe the touchpad.
-- Diagnostics: `[import-retire]`, `[storage-refresh]`, `[flush-wait]`, `[bad-bda]`, `APS5_BUFFER_VA_HISTORY=1`,
-  `APS5_SKIP_SHADER=<address,...>`; under `APS5_PROFILE_DRAW` also `[invocation-for]`, `[depth-surfaces]`, the
+- Diagnostics: `[import-retire]`, `[storage-refresh]` (with both images' addresses and sizes), `[flush-wait]`, `[bad-bda]`,
+  `APS5_BUFFER_VA_HISTORY=1`, `APS5_TRACE_SAMPLED_ADDR=<address>`, `APS5_WATCH_BYTES=<address>+<bytes>` (unstamped changes
+  of a range per present), `APS5_TRACE_STORAGE_RANGE=<begin>-<end>` (every storage image's pending/stored history over
+  a range), `APS5_TRACE_MARK_ADDR=<address>`, `APS5_TRACE_CB_RACE=1`, `APS5_TRACE_THREADS=1`; under `APS5_PROFILE_DRAW`
+  also `[lock]` (with holder thread names), `[storage-surfaces]`, `[clamp-memo]`, `[index-scan]`, `[draw-snapshot-refresh]`,
+  `[storage-cpu-upload]`, and
+  `APS5_SKIP_SHADER=<address,...>`; `[invocation-for]`, `[depth-surfaces]`, the
   `[bufferpool]` evictions by cause and the `[draw] pipelined` write-scan sample; `APS5_VERIFY_COLLECT_HEAP=1` and
   `APS5_VERIFY_BDA_INCREMENTAL=1` check the new paths against the old ones; `APS5_DUMP_QUEUE=<queue>` with
   `APS5_DUMP_QUEUE_SKIP=<n>` dumps a queue's packets after its first n submissions.
@@ -138,12 +178,17 @@ memory), plus two env-gated debug aids (`RADV_PRINT_SHADER_VA`, `RADV_DUMP_SHADE
 
 ## Known issues
 
-- About 1.6 fps in the open world: per frame (~640 ms) about 330 ms of GPU work; the rest waits on the CPU side. The draw
-  committer now records both the draws and queue 0's dispatches and is ~72 % busy; it also waits ~1.1 s per 10 s for the
-  GPU mutex behind the compute queues' dispatches. Address-based (BDA) draws, ~27 % of its work, are built on it because
-  the preparer thread can't map address tables yet; that is the next step.
-- One run crashed at boot on a zero dword in the title's command buffer ("unsupported PM4 packet type"); the cause is
-  unknown and it hasn't happened again in the runs since.
+- About 2.2 fps in the open world: a frame (~480 ms) is queue 0 recording it (~416 ms; the draw committer ~67 % busy,
+  ~40 us per commit, holding the GPU mutex for each draw and waiting ~1 s per 10 s behind the compute queues'
+  dispatches) plus the GPU finishing it (~45 ms after recording ends) plus the title reacting (~19 ms). At the title
+  menu (~82 ms a frame) the committer is ~54 % busy; the rest is queue 0 waiting on async-compute labels (~13 ms) and
+  the title's turnaround after each frame (~12 ms).
+- About 1 boot in 8 crashes around presents 550-605 ("unsupported PM4 packet type", invalid command-buffer cursors or a
+  SIGSEGV): the title's main thread and a JobWorker thread append to one global compute command buffer at the same
+  time (`APS5_TRACE_CB_RACE=1` shows it). Not fixed; restart the game when it happens.
+- Colours need `APS5_NO_PRECISE_SMALL_OVERLAP=1`: without it the reflection probe's per-frame GPU results are never
+  stored, so reflections bleach (the katana on the title menu, hair and wood in the world). The workaround costs about
+  4 % at the menu; the reader that misses those results isn't found yet.
 - Merged LS+HS hull draws (tessellation) are skipped, so some geometry is missing.
 - Shader `0x80001df900` (clustered-lighting compute pass, 747,518 SPIR-V words) used to hang or fault and was skipped;
   with the ACO LDS spill fix it compiles (about 39 s cold) and runs in the world without faults, so it is no longer skipped.
