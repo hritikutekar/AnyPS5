@@ -46,6 +46,7 @@
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <unwind.h>
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -84,13 +85,48 @@ void require(bool condition, const char* reason) {
 }
 
 // A code address relative to its module, for symbolizing debug traces with nm.
+#ifndef _WIN32
+// The driver's image in this process ([begin, end) of the mappings of its file, begin = file offset
+// 0), read once from /proc/self/maps: the module offsets the reports print (nm/addr2line against the
+// .prx) are taken against it. {0, 0} when not found (offsets stay absolute addresses).
+std::pair<std::uintptr_t, std::uintptr_t> driverImage() {
+    static const auto image = [] {
+        const auto self = reinterpret_cast<std::uintptr_t>(&driverImage);
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        std::vector<std::tuple<std::uintptr_t, std::uintptr_t, unsigned long long, std::string>> rows;
+        std::string path;
+        while (std::getline(maps, line)) {
+            unsigned long long begin = 0, end = 0, offset = 0;
+            char perms[8] = {};
+            int consumed = 0;
+            if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx %*s %*s%n", &begin, &end, perms, &offset, &consumed) < 4) continue;
+            auto name = line.substr(static_cast<std::size_t>(consumed));
+            name.erase(0, name.find_first_not_of(' '));
+            if (self >= begin && self < end) path = name;
+            rows.emplace_back(begin, end, offset, std::move(name));
+        }
+        std::uintptr_t first = 0, last = 0;
+        for (const auto& [begin, end, offset, name] : rows) {
+            if (path.empty() || name != path) continue;
+            if (offset == 0 && (first == 0 || begin < first)) first = begin;
+            last = std::max<std::uintptr_t>(last, end);
+        }
+        return first != 0 ? std::pair<std::uintptr_t, std::uintptr_t>{first, last} : std::pair<std::uintptr_t, std::uintptr_t>{0, 0};
+    }();
+    return image;
+}
+#endif
+
 unsigned long long ModuleOffset(const void* address) {
 #ifdef _WIN32
     HMODULE module = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(address), &module);
     return reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(module);
 #else
-    return reinterpret_cast<std::uintptr_t>(address);
+    const auto [begin, end] = driverImage();
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    return value >= begin && value < end ? value - begin : value;
 #endif
 }
 
@@ -322,9 +358,29 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     }
     return captured;
 #else
-    static_cast<void>(skip);
-    frames[0] = ModuleOffset(__builtin_return_address(0));
-    return 1;
+    // libgcc's unwinder (the driver's unwind tables, no frame pointers needed); frame 0 is this
+    // function's caller. Addresses outside the driver are kept absolute.
+    struct Walk {
+        std::span<unsigned long long> frames;
+        unsigned skip;
+        std::size_t count = 0;
+    } walk{frames, skip + 1};
+    _Unwind_Backtrace([](_Unwind_Context* context, void* argument) -> _Unwind_Reason_Code {
+        auto& state = *static_cast<Walk*>(argument);
+        const auto ip = _Unwind_GetIP(context);
+        if (ip == 0) return _URC_END_OF_STACK;
+        if (state.skip != 0) {
+            --state.skip;
+            return _URC_NO_REASON;
+        }
+        state.frames[state.count++] = ModuleOffset(reinterpret_cast<const void*>(ip));
+        return state.count < state.frames.size() ? _URC_NO_REASON : _URC_END_OF_STACK;
+    }, &walk);
+    if (walk.count == 0) {
+        frames[0] = ModuleOffset(__builtin_return_address(0));
+        return 1;
+    }
+    return walk.count;
 #endif
 }
 
