@@ -324,6 +324,8 @@ struct SpirvTarget {
     // f16 FMA (v_fma_f16, v_pk_fma_f16) as a native f16 Fma, and packed native f16 results without the per-lane
     // NaN fix-ups (an AMD host computes them in hardware: the driver sets it, APS5_NO_NATIVE_F16_FMA=1 clears it).
     bool nativeF16Fma = false;
+    // f32 min/max and saturate as GLSL NMin/NMax/NClamp (an AMD host: the driver sets it, APS5_NO_NATIVE_MINMAX=1 clears it).
+    bool nativeF32MinMax = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;

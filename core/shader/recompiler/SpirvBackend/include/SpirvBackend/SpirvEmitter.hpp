@@ -34,6 +34,7 @@ struct SpirvTargetOptions {
     bool bdaContinueWaveOperations = false;
     bool fusedFma = false;
     bool nativeMixF16 = false;
+    bool nativeF32MinMax = false;
     // ShaderComputeStageInfo::singleWorkgroup of the request.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;

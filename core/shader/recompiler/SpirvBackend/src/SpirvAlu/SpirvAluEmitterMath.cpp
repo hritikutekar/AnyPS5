@@ -714,6 +714,8 @@ std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0,
 }
 
 std::uint32_t EmitFPSaturate32(SpirvEmitterState& state, std::uint32_t arg0) {
+    // SpirvTarget::nativeF32MinMax: NClamp to [0, 1] (NaN and -0 give +0, as the integer form below).
+    if (state.nativeF32MinMax) return EmitExt(state, TypeF32(state), GLSLstd450NClamp, {arg0, ConstantF32(state, 0x00000000u), ConstantF32(state, 0x3f800000u)});
     const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), arg0);
     const auto positive = Binary(state, spv::OpULessThan, TypeBool(state), Binary(state, spv::OpISub, TypeU32(state), bits, ConstantU32(state, 1u)), ConstantU32(state, 0x7f800000u));
     const auto upper = EmitExt(state, TypeU32(state), GLSLstd450UMin, {bits, ConstantU32(state, 0x3f800000u)});

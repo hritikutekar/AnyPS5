@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
+#include <cstdlib>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include "PipelineSpecialization.hpp"
@@ -1474,6 +1475,13 @@ std::uint32_t EmitClassMaskF32(SpirvEmitterState& state, std::uint32_t value, st
 }
 
 std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+    // SpirvTarget::nativeF32MinMax: NMin/NMax, which an AMD host computes as the guest's v_min/v_max_f32 do (the
+    // non-NaN operand, -0 below +0); the emulation below costs ~10 instructions per use.
+    if (state.nativeF32MinMax) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state), maxValue ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+        return result;
+    }
     const auto lhsClass = EmitClassifyF32(state, lhs);
     const auto rhsClass = EmitClassifyF32(state, rhs);
 

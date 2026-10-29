@@ -290,6 +290,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.fusedFma = target.fusedFma;
     state.nativeMixF16 = target.nativeMixF16;
+    state.nativeF32MinMax = target.nativeF32MinMax;
     state.singleWorkgroup = target.singleWorkgroup && program.Resources().stage == IrShaderStage::Compute;
     state.robustBufferAccess2 = target.robustBufferAccess2;
     state.float32FlushToZero = target.float32FlushToZero;
