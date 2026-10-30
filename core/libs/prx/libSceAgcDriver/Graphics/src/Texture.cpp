@@ -2366,6 +2366,10 @@ LookupOutcomes& ThreadLookupOutcomes() {
 // APS5_PROFILE_DRAW: storage refreshes by outcome (nothing to flush, alias borrowed, a same-shape
 // alias rejected and why, or how the other pending image differs), as a [storage-refresh] line
 // every 10 s with the most frequent kinds first.
+// With APS5_CLEAR_HAND_OVER=1, this thread's last clearHandOver outcome ("handed over" or why not), named in the
+// [storage-refresh] kind.
+thread_local std::string handOverOutcome;
+
 void NoteRefreshOutcome(bool flushed, bool borrowed, const char* aliasRejected, const std::string& overlapKind) {
     static std::mutex mutex;
     static std::map<std::string, std::uint64_t> counts;
@@ -2374,12 +2378,37 @@ void NoteRefreshOutcome(bool flushed, bool borrowed, const char* aliasRejected, 
     if (!flushed) key = borrowed ? "borrowed, nothing else to flush" : "nothing to flush";
     else if (borrowed) key = "borrowed alias, flushed others";
     else if (aliasRejected != nullptr) key = std::string("flushed: same-shape alias rejected (") + aliasRejected + ")";
-    else key = "flushed: " + overlapKind;
+    else key = "flushed: " + overlapKind.substr(0, overlapKind.find(" {"));
+    static std::map<std::string, std::uint64_t> handOvers;
+    const auto handOver = std::exchange(handOverOutcome, std::string());
+    if (!handOver.empty()) key += " [hand-over: " + handOver + "]";
     std::lock_guard lock(mutex);
     ++counts[key];
+    if (!handOver.empty() && (flushed || handOver.rfind("handed over", 0) == 0)) ++handOvers[handOver];
+    // Flushing refreshes by kind without the per-surface detail, as a [storage-refresh-kinds] line.
+    static std::map<std::string, std::uint64_t> kinds;
+    if (flushed) {
+        const auto shapes = overlapKind.find(" {");
+        ++kinds[aliasRejected != nullptr ? std::string("same-shape alias rejected (") + aliasRejected + ")" : overlapKind.substr(0, overlapKind.find(" (")) + (shapes != std::string::npos ? overlapKind.substr(shapes) : std::string())];
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
+    if (!kinds.empty()) {
+        std::string kindLine = "[storage-refresh-kinds] (10 s) refreshes that flushed others, by how the other pending image differs:";
+        std::vector<std::pair<std::string, std::uint64_t>> sortedKinds(kinds.begin(), kinds.end());
+        std::sort(sortedKinds.begin(), sortedKinds.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (std::size_t index = 0; index < sortedKinds.size() && index < 16; ++index) kindLine += " " + std::to_string(sortedKinds[index].second) + " " + sortedKinds[index].first + ";";
+        kindLine += " (" + std::to_string(sortedKinds.size()) + " kinds)";
+        std::fprintf(stderr, "%s\n", kindLine.c_str());
+        kinds.clear();
+    }
+    if (!handOvers.empty()) {
+        std::string handOverLine = "[hand-over] (10 s) refreshes that flushed others or handed over, by clear hand-over outcome:";
+        for (const auto& [why, count] : handOvers) handOverLine += " " + std::to_string(count) + " " + why + ";";
+        std::fprintf(stderr, "%s\n", handOverLine.c_str());
+        handOvers.clear();
+    }
     // Kinds with their size details folded into one line each, top 8 by count.
     std::vector<std::pair<std::string, std::uint64_t>> sorted(counts.begin(), counts.end());
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -2515,6 +2544,9 @@ bool StorageTexture::Refresh() {
             }
             char detail[320];
             std::snprintf(detail, sizeof(detail), " (%ux%u fmt %u tile %u mips %u at 0x%llx+0x%llx extent 0x%llx vs %ux%u fmt %u tile %u mips %u at 0x%llx+0x%llx extent 0x%llx)", descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(elementExtent), theirs.width, theirs.height, static_cast<unsigned>(theirs.format), static_cast<unsigned>(theirs.tileMode), theirs.mipCount, static_cast<unsigned long long>(theirs.baseAddress), static_cast<unsigned long long>(texture->guestBytes), static_cast<unsigned long long>(texture->elementExtent));
+            overlapKind += detail;
+            // The shapes without addresses, for [storage-refresh-kinds]: offset of theirs from this image, mip and layer counts.
+            std::snprintf(detail, sizeof(detail), " {%ux%u fmt %u tile %u mips %u layers %u bytes 0x%llx vs %ux%u fmt %u tile %u mips %u layers %u bytes 0x%llx at %+lld}", descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.mipCount, arrayLayers, static_cast<unsigned long long>(guestBytes), theirs.width, theirs.height, static_cast<unsigned>(theirs.format), static_cast<unsigned>(theirs.tileMode), theirs.mipCount, texture->arrayLayers, static_cast<unsigned long long>(texture->guestBytes), static_cast<long long>(theirs.baseAddress) - static_cast<long long>(begin));
             overlapKind += detail;
             break;
         }
@@ -5735,27 +5767,36 @@ std::uint64_t StorageTexture::HandedOverSuperseded() {
 }
 
 std::optional<DccKeys> StorageTexture::clearHandOver() {
-    if (!ClearHandOverOn().load(std::memory_order_relaxed) || !blockUnits || descriptor.dccAddress == 0 || anyLayerPending()) return std::nullopt;
-    if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return std::nullopt;
+    if (!ClearHandOverOn().load(std::memory_order_relaxed)) return std::nullopt;
+    const auto reject = [](std::string why) -> std::optional<DccKeys> {
+        handOverOutcome = std::move(why);
+        return std::nullopt;
+    };
+    if (!blockUnits) return reject("untracked units");
+    if (descriptor.dccAddress == 0) return reject("no DCC");
+    if (anyLayerPending()) return reject("own units pending");
+    if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return reject("not watched");
     const auto others = overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (others.empty()) return std::nullopt;
+    if (others.empty()) return reject("no other pending");
     const auto begin = descriptor.baseAddress;
     const auto end = descriptor.baseAddress + guestBytes;
     const auto keyBytes = DccKeyBytes(guestBytes);
     for (const auto& other : others) {
-        if (!other->blockUnits || (other->descriptor.dccAddress != 0 && other->uploadedKeys != DccKeys::Uncompressed)) return std::nullopt;
-        if (other->descriptor.dccAddress != 0 && other->descriptor.dccAddress < descriptor.dccAddress + keyBytes && descriptor.dccAddress < other->descriptor.dccAddress + DccKeyBytes(other->guestBytes)) return std::nullopt;
+        if (!other->blockUnits) return reject("other untracked units");
+        if (other->descriptor.dccAddress != 0 && other->uploadedKeys != DccKeys::Uncompressed) return reject(std::string("other uploaded keys ") + DccKeysName(other->uploadedKeys));
+        if (other->descriptor.dccAddress != 0 && other->descriptor.dccAddress < descriptor.dccAddress + keyBytes && descriptor.dccAddress < other->descriptor.dccAddress + DccKeyBytes(other->guestBytes)) return reject("DCC keys overlap");
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
             if (!other->layerPending[unit]) continue;
             const auto from = other->layerBegin(unit);
             const auto to = from + other->layerBytes(unit);
             if (to <= begin || from >= end) continue;
-            if (from < begin || to > end || other->layerBytes(unit) != trackedLayerBytes) return std::nullopt;
+            if (from < begin || to > end || other->layerBytes(unit) != trackedLayerBytes) return reject("other unit straddles or differs in size");
         }
     }
     const auto keys = ProvedKeys();
     VkClearColorValue clear{};
-    if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clear)) return std::nullopt;
+    if (!IsDccClear(keys)) return reject(std::string("keys ") + DccKeysName(keys));
+    if (!ClearColorFor(storageFormat, keys, clear)) return reject(std::string("no clear colour for ") + DccKeysName(keys));
     if (handedUnits.size() != trackedLayers) handedUnits.assign(trackedLayers, false);
     for (const auto& other : others) {
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
@@ -5767,6 +5808,7 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
         else handedOver.emplace_back(other, other->writes);
     }
     clearHandOvers.fetch_add(1, std::memory_order_relaxed);
+    handOverOutcome = std::string("handed over ") + DccKeysName(keys);
     return keys;
 }
 
