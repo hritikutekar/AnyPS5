@@ -2887,6 +2887,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(DrawTimingKey()) : Recorder::NoTiming;
+    // Diagnostic (APS5_PROFILE_GPU_PASS=1, with APS5_PROFILE_GPU): a new pass's range split into its lead (proxy
+    // loads, barriers, indirect argument copies), body (begin through its last draw) and end (Recorder).
+    static const bool passPhases = std::getenv("APS5_PROFILE_GPU_PASS") != nullptr;
+    const auto leadTiming = !continued && passPhases ? recorder->BeginGpuTiming(CommandClass::DrawLead) : Recorder::NoTiming;
+    auto bodyTiming = Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2935,6 +2940,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        recorder->EndGpuTiming(leadTiming);
+        if (passPhases && leadTiming != Recorder::NoTiming) bodyTiming = recorder->BeginGpuTiming(CommandClass::DrawBody);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, &recorder->PassBound());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
@@ -2978,7 +2985,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
-    recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies), bodyTiming);
     timer.phase(PhaseRecord);
     if (record.blended != nullptr) {
         recorder->Keep(record.blended);
