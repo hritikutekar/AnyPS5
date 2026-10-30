@@ -518,7 +518,13 @@ void Driver::execute(const Submission& submission) {
                 timeline.maxFirstMs = std::max(timeline.maxFirstMs, first);
             }
         }
-        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        // A GPU-side DISPATCH_INDIRECT becomes a draw-pipeline item (Dispatch.cpp IndirectDispatchItems): the GPU reads
+        // its arguments, so it keeps the pipeline; the CPU-side paths read them now and drain first, as before.
+        const auto indirectItem = [&] {
+            if (opcode != 0x16 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch) || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoIndirectDispatchItems)) return false;
+            return indirectArgumentsPath(packet, Pm4::DispatchArgumentAddress(packet, queue)) == IndirectGpu;
+        };
+        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !indirectItem()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();

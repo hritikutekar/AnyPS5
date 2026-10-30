@@ -87,6 +87,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DEFER_GPU_READ_FLUSH",
     "APS5_NO_RESIDENT_RANGES",
     "APS5_NO_LANE_OPEN_WAIT",
+    "APS5_NO_INDIRECT_DISPATCH_ITEMS",
 };
 
 struct Refusal {

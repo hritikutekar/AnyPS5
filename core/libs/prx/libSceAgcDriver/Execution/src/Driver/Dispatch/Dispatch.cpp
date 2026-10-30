@@ -56,6 +56,14 @@ bool DispatchMissItemsEnabled() {
     return DispatchItemsEnabled() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatchMisses);
 }
 
+// Queue 0's GPU-side DISPATCH_INDIRECTs as draw-pipeline items too (APS5_NO_INDIRECT_DISPATCH_ITEMS=1 off, a
+// runtime switch): the GPU reads the arguments when the dispatch runs, and the commit decides the GPU or CPU path
+// (VulkanDevice::decideIndirect) after every earlier item has recorded, as the drain before the packet left it; the
+// item holds a CPU store to the argument dwords until it commits (DrawPipeline::HeldReads).
+bool IndirectDispatchItems() {
+    return DispatchItemsEnabled() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoIndirectDispatchItems);
+}
+
 bool NoDispatchItems() {
     static const bool none = std::getenv("APS5_PIPELINE_DISPATCH_NO_ITEMS") != nullptr;
     return none;
@@ -208,6 +216,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         indirectArguments = ahead.indirectArguments;
     } else if (indirectArguments != 0 && !resolving && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
         indirectSource().path = IndirectFillKernel;
+        // The CPU reads the arguments: earlier items that write them record first (the packet kept the pipeline).
+        if (IndirectDispatchItems() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x16);
         const auto readStart = std::chrono::steady_clock::now();
         resolved = readDispatchArguments(submission.queue, indirectArguments, packet[4]);
         countIndirect(IndirectFillKernel, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
@@ -218,7 +228,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && (indirectArguments == 0 || IndirectDispatchItems()) && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     struct HtileMaskClear {
         std::uint64_t address = 0;
@@ -643,13 +653,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         // next depth draw's store-back knows the newest writer of the range instead of pre-syncing
         // on the whole GPU (found by shahulmubeen-a; APS5_NO_HIT_ITEM_HTILE_NOTE=1 off, a runtime switch).
         const bool noteHtile = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHitItemHtileNote);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileMask, noteHtile] {
+        std::vector<DrawPipeline::Range> itemReads;
+        if (indirectArguments != 0) itemReads.push_back({indirectArguments, indirectArguments + 12});
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileMask, noteHtile, indirectArguments, threadGroup] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
-                std::shared_ptr<RecipeHit> recipeHit = localDevice->PrepareRecipe(recipe, false);
+                std::shared_ptr<RecipeHit> recipeHit = localDevice->PrepareRecipe(recipe, indirectArguments != 0);
                 std::shared_ptr<const Recipe> builtRecipe;
                 bool writersNoted = false;
                 for (;;) {
@@ -664,13 +676,17 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     }
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
-                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup);
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
-                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, indirectArguments != 0);
                             itemRebuilds.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
+                        if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                    } else if (indirectArguments != 0) {
+                        const auto outcome = localDevice->DispatchIndirect(compiledCommit, indirectArguments, snapshots, address, std::move(prepared), &builtRecipe, threadGroup);
+                        countIndirect(outcome.cpuReason, outcome.argumentReadMs);
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), &builtRecipe);
                     }
@@ -685,14 +701,14 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                         builtRecipe = std::move(own);
                     }
                     keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
-                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, indirectArguments != 0);
                 }
             } catch (const std::exception& error) {
                 char where[64];
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites));
+        }, std::move(itemWrites), 0, {}, std::move(itemReads));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;
@@ -745,7 +761,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 slot->Finish(std::move(item));
             };
         }
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, itemInputs, slot, liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+        std::vector<DrawPipeline::Range> itemReads;
+        if (indirectArguments != 0) itemReads.push_back({indirectArguments, indirectArguments + 12});
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, itemInputs, slot, liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch, indirectArguments, threadGroup] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -764,7 +782,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     recordLabelsForPacket(localDevice.get(), queueId);
                     if (noteWrites && writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
-                    localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], commitSnapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                    if (indirectArguments != 0) {
+                        const auto outcome = localDevice->DispatchIndirect(compiledCommit, indirectArguments, commitSnapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup);
+                        countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                    } else {
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], commitSnapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                    }
                     if (htileMask.address != 0) localDevice->NoteHtileMask(htileMask.address, htileMask.bytes, htileMask.mask, htileMask.value);
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
@@ -775,7 +798,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                         builtRecipe = std::move(own);
                     }
                     attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
-                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, indirectArguments != 0);
                 }
             } catch (const ShaderRefusal&) {
                 missItemRefusals.fetch_add(1, std::memory_order_relaxed);
@@ -784,7 +807,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites), 0, {}, {}, std::move(prepare));
+        }, std::move(itemWrites), 0, {}, std::move(itemReads), std::move(prepare));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;
