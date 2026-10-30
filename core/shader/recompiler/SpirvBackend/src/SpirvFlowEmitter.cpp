@@ -305,6 +305,20 @@ void Invoke(TReturn (*emit)(TContext&, TArguments...), SpirvValueEmitContext& ct
     }(std::index_sequence_for<TArguments...>{});
 }
 
+// (x & 0x7fffffff) > 0x7f800000, the translation's NaN test on f32 bits, as one unordered compare under
+// SpirvTarget::nativeF32IsNan.
+std::uint32_t EmitUGreaterThan32Value(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    const auto* limit = inst.Argument(1)->Resolve();
+    const auto* magnitude = inst.Argument(0)->Resolve();
+    if (ctx.state.nativeF32IsNan && limit->HasImmediate() && limit->ImmediateU32() == 0x7f800000u && magnitude->Opcode() == IrOpcode::BitwiseAnd32) {
+        for (std::size_t side = 0; side < 2u; ++side) {
+            const auto* mask = magnitude->Argument(side)->Resolve();
+            if (mask->HasImmediate() && mask->ImmediateU32() == 0x7fffffffu) return EmitF32BitsIsNan(ctx.state, ctx.Def(magnitude->Argument(1u - side)));
+        }
+    }
+    return EmitUGreaterThan32(ctx.state, ctx.Def(inst.Argument(0)), ctx.Def(inst.Argument(1)));
+}
+
 void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
     switch (inst.Opcode()) {
         case IrOpcode::Identity: return Invoke(EmitIdentity, ctx, inst);
@@ -449,7 +463,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SLessThanEqual32: return Invoke(EmitSLessThanEqual32, ctx, inst);
         case IrOpcode::ULessThanEqual32: return Invoke(EmitULessThanEqual32, ctx, inst);
         case IrOpcode::SGreaterThan32: return Invoke(EmitSGreaterThan32, ctx, inst);
-        case IrOpcode::UGreaterThan32: return Invoke(EmitUGreaterThan32, ctx, inst);
+        case IrOpcode::UGreaterThan32: return Invoke(EmitUGreaterThan32Value, ctx, inst);
         case IrOpcode::UGreaterThan64: return Invoke(EmitUGreaterThan64, ctx, inst);
         case IrOpcode::INotEqual32: return Invoke(EmitINotEqual32, ctx, inst);
         case IrOpcode::INotEqual64: return Invoke(EmitINotEqual64, ctx, inst);

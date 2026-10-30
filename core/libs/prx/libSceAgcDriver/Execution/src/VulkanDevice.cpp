@@ -4172,6 +4172,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nativeF16Fma = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_F16_FMA") == nullptr;
     // f32 min/max and saturate in hardware on AMD hosts (SpirvTarget::nativeF32MinMax); APS5_NO_NATIVE_MINMAX=1 off.
     target.nativeF32MinMax = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_MINMAX") == nullptr;
+    // f32 NaN tests on the bits as one unordered compare on AMD hosts (SpirvTarget::nativeF32IsNan); APS5_NO_NATIVE_ISNAN=1 off.
+    target.nativeF32IsNan = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_ISNAN") == nullptr;
     target.float16DenormPreserve = state->float16DenormPreserve;
     target.bindlessImages = state->bindlessImages;
     target.spannedWaves = state->spannedWaves;

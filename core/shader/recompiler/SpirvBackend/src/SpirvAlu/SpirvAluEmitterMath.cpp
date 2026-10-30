@@ -897,7 +897,7 @@ std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::
     const auto boolean = TypeBool(state);
     const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
     const auto value = [&](std::uint32_t valueBits) { return Unary(state, spv::OpBitcast, TypeF32(state), valueBits); };
-    const auto isNan = [&](std::uint32_t valueBits) { return EmitCompareU32Constant(state, spv::OpUGreaterThan, EmitAndConstant(state, valueBits, 0x7fffffffu), 0x7f800000u); };
+    const auto isNan = [&](std::uint32_t valueBits) { return EmitF32BitsIsNan(state, valueBits); };
     const auto numeric = [&](std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
         const auto either = Binary(state, spv::OpBitwiseOr, u32, lhs, rhs);
         const auto bothZero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, either, 0x7fffffffu), 0u);

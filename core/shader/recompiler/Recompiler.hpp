@@ -326,6 +326,10 @@ struct SpirvTarget {
     bool nativeF16Fma = false;
     // f32 min/max and saturate as GLSL NMin/NMax/NClamp (an AMD host: the driver sets it, APS5_NO_NATIVE_MINMAX=1 clears it).
     bool nativeF32MinMax = false;
+    // An f32 NaN test written on the bits ((x & 0x7fffffff) > 0x7f800000) as one unordered compare of x with itself:
+    // exact under SignedZeroInfNanPreserve 32, which the device requires (an AMD host: the driver sets it,
+    // APS5_NO_NATIVE_ISNAN=1 clears it).
+    bool nativeF32IsNan = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;

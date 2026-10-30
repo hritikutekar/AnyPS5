@@ -130,6 +130,8 @@ struct SpirvEmitterState {
     bool nativeMixF16 = false;
     // See SpirvTarget::nativeF32MinMax.
     bool nativeF32MinMax = false;
+    // See SpirvTarget::nativeF32IsNan.
+    bool nativeF32IsNan = false;
     // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
     bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;

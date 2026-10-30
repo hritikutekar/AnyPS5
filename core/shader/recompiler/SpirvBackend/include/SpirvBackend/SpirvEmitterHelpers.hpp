@@ -149,6 +149,8 @@ std::uint32_t EmitSubConstantMinusU32(SpirvEmitterState& state, std::uint32_t co
 std::uint32_t EmitF32ToF16RtzBits(SpirvEmitterState& state, std::uint32_t f32);
 std::uint32_t EmitMinMaxU32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue);
 std::uint32_t EmitMinMaxI32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue);
+// (bits & 0x7fffffff) > 0x7f800000, or SpirvTarget::nativeF32IsNan's unordered compare.
+std::uint32_t EmitF32BitsIsNan(SpirvEmitterState& state, std::uint32_t bits);
 F32Class EmitClassifyF32Bits(SpirvEmitterState& state, std::uint32_t bits);
 F32Class EmitClassifyF32(SpirvEmitterState& state, std::uint32_t value);
 std::uint32_t EmitClassMaskBitMatch(SpirvEmitterState& state, std::uint32_t mask, std::uint32_t bit, std::uint32_t classMatch);

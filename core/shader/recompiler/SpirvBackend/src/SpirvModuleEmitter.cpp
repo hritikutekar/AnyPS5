@@ -1418,11 +1418,20 @@ std::uint32_t EmitMinMaxI32Value(SpirvEmitterState& state, std::uint32_t lhs, st
     return Select(state, TypeU32(state), condition, lhs, rhs);
 }
 
+std::uint32_t EmitF32BitsIsNan(SpirvEmitterState& state, std::uint32_t bits) {
+    // SpirvTarget::nativeF32IsNan: x != x (unordered) is true exactly for the NaN encodings under SignedZeroInfNanPreserve.
+    if (state.nativeF32IsNan) {
+        const auto value = Unary(state, spv::OpBitcast, TypeF32(state), bits);
+        return Binary(state, spv::OpFUnordNotEqual, TypeBool(state), value, value);
+    }
+    return EmitCompareU32Constant(state, spv::OpUGreaterThan, EmitAndConstant(state, bits, 0x7fffffffu), 0x7f800000u);
+}
+
 F32Class EmitClassifyF32Bits(SpirvEmitterState& state, std::uint32_t bits) {
     F32Class cls;
     cls.bits = bits;
     const auto absBits = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-    cls.nan = EmitCompareU32Constant(state, spv::OpUGreaterThan, absBits, 0x7f800000u);
+    cls.nan = EmitF32BitsIsNan(state, cls.bits);
     cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, absBits, 0u);
     return cls;
 }
