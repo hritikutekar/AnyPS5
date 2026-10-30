@@ -164,7 +164,11 @@ bool orderedFills() {
 }
 
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
-    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
+    if (header == FlipPacketHeader) return false;
+    // WAIT_FLIP_DONE waits on the host for an earlier flip (which drained the pipeline when it ran) and holds only the
+    // packets after it: the committer records the frame's queued draws meanwhile. APS5_NO_FLIP_WAIT_KEEP=1 (a runtime
+    // switch) drains first as before.
+    if (header == RenderingWaitPacketHeader) return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoFlipWaitKeep);
     if (Pm4::DrawOpcode(opcode)) return true;
     const bool dmaItems = DrawPipeline::DmaItems();
     switch (opcode) {
@@ -524,7 +528,20 @@ void Driver::execute(const Submission& submission) {
             if (opcode != 0x16 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PipelineDispatch) || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoIndirectDispatchItems)) return false;
             return indirectArgumentsPath(packet, Pm4::DispatchArgumentAddress(packet, queue)) == IndirectGpu;
         };
-        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !indirectItem()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode) && !indirectItem()) {
+            // Diagnostic (APS5_PROFILE_DRAW): the NOP-family operations that drain, named once each as [nop-drain].
+            static const bool nopProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (nopProfile && opcode == 0x10 && header != FlipPacketHeader) {
+                static std::atomic<std::uint64_t> named{0};
+                const auto operation = (header >> 2u) & 0x3fu;
+                if ((named.fetch_or(1ull << operation, std::memory_order_relaxed) & (1ull << operation)) == 0) {
+                    std::fprintf(stderr, "[nop-drain] header 0x%08x operation 0x%x words %zu:", header, operation, packet.size());
+                    for (std::size_t word = 1; word < packet.size() && word < 9; ++word) std::fprintf(stderr, " %08x", packet[word]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        }
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
