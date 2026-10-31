@@ -4691,8 +4691,11 @@ struct ResidentRanges {
 };
 
 ResidentRanges& Residents() {
-    static ResidentRanges ranges;
-    return ranges;
+    // Never destroyed: a static destructor would release the resident buffers into the buffer pool after the
+    // device is gone at process exit (Buffer::release -> BufferPool::Put; Celegans12's frame replay tool crashed
+    // there after every replay, efd24a7976).
+    static auto* ranges = new ResidentRanges;
+    return *ranges;
 }
 
 constexpr std::size_t ResidentLimit = 32;
