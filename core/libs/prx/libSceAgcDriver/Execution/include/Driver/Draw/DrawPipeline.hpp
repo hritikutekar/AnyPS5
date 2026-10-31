@@ -77,6 +77,8 @@ public:
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    // The first queued item write range over [address, address + bytes), or {0, 0} (diagnostics).
+    Range FirstOverlap(std::uint64_t address, std::size_t bytes);
     bool DrainIfOverlaps(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current()) {
         return DrainIfOverlaps(ranges, [](const Range& range) { return range; }, reason, opcode, where);
     }

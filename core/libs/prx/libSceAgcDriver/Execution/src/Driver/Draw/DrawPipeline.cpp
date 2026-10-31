@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include <bit>
+#include <map>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -155,6 +157,34 @@ bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes, std
     if (!Active()) return false;
     auto& pipeline = Queue0();
     if (!pipeline.Busy() || !pipeline.Overlaps(address, bytes)) return false;
+    // Diagnostic (APS5_PROFILE_DRAW): capture reads that drain, by read size and the size of the queued write range
+    // they overlap (a wide range over a small read hints at a conservative write bound), as [capture-drain] per 10 s.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto write = pipeline.FirstOverlap(address, bytes);
+        const auto bucket = [](std::uint64_t value) {
+            char text[16];
+            if (value < 1024) std::snprintf(text, sizeof(text), "%lluB", static_cast<unsigned long long>(value));
+            else if (value < 1048576) std::snprintf(text, sizeof(text), "%lluK", static_cast<unsigned long long>(value >> 10u));
+            else std::snprintf(text, sizeof(text), "%lluM", static_cast<unsigned long long>(value >> 20u));
+            return std::string(text);
+        };
+        const auto pow2 = [](std::uint64_t value) { return value <= 1 ? value : std::uint64_t{1} << (64 - std::countl_zero(value - 1)); };
+        static std::mutex mutex;
+        static std::map<std::string, std::uint64_t> kinds;
+        static auto last = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex);
+        ++kinds["read <=" + bucket(pow2(bytes)) + " in write <=" + bucket(pow2(write.second - write.first)) + (write.first <= address && write.second >= address + bytes ? "" : " (partial)")];
+        if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(10)) {
+            last = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::string, std::uint64_t>> sorted(kinds.begin(), kinds.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string line = "[capture-drain] (10 s) capture reads that drained, by read size and overlapped queued write range:";
+            for (std::size_t index = 0; index < sorted.size() && index < 12; ++index) line += " " + std::to_string(sorted[index].second) + " " + sorted[index].first + ";";
+            std::fprintf(stderr, "%s\n", line.c_str());
+            kinds.clear();
+        }
+    }
     pipeline.Drain(DrainReason::Capture, 0x100, where);
     return true;
 }
@@ -577,6 +607,17 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
         }
     }
     return false;
+}
+
+DrawPipeline::Range DrawPipeline::FirstOverlap(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        for (const auto& range : item.writes) {
+            if (address < range.second && range.first < end) return range;
+        }
+    }
+    return {0, 0};
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
