@@ -378,6 +378,11 @@ struct TableCounters {
     std::atomic<std::uint64_t> selected{0};
     std::atomic<std::uint64_t> reusedUnwritten{0};
     std::atomic<std::uint64_t> reusedCompared{0};
+    // Full column rebuilds by why no memo answered (diagnostics).
+    std::atomic<std::uint64_t> fullNotMemoized{0};
+    std::atomic<std::uint64_t> fullNoMemo{0};
+    std::atomic<std::uint64_t> fullDiffered{0};
+    std::atomic<std::uint64_t> fullUncompared{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<long long> lastReport{0};
 };
@@ -427,9 +432,9 @@ void reportTables() {
         skips += " " + std::string(NarrowSkipNames[reason]) + "=" + std::to_string(count);
         if (reason == static_cast<std::size_t>(NarrowSkip::KeyScan)) skips += " (up to " + std::to_string(counters.narrowPositions.exchange(0, std::memory_order_relaxed)) + " positions, APS5_IMAGE_TABLE_KEY_SCAN " + std::to_string(TableKeyScanLimit()) + ")";
     }
-    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms\n",
+    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, full rebuilds: not memoized %llu, no memo %llu, memo differed %llu, memo uncompared %llu; %.1f ms\n",
         static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.selected.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
-        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
+        static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullNotMemoized.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullNoMemo.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullDiffered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.fullUncompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
 }
 
 enum class RecordState : std::uint8_t { OutsideDomain, Read, Unmapped, Carried };
@@ -544,7 +549,16 @@ struct ColumnMemo {
     }
 };
 
-constexpr std::size_t ColumnMemoEntries = 16;
+// Column memos kept per thread: 64 (a menu frame cycles through more columns than 16, whose evictions forced ~3,000 full
+// rebuilds per 10 s). APS5_TABLE_MEMO_ENTRIES=<n> sets it (16 is the previous count; cache-neutral, read once).
+std::size_t ColumnMemoEntries() {
+    static const std::size_t entries = [] {
+        const char* value = std::getenv("APS5_TABLE_MEMO_ENTRIES");
+        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        return parsed != 0ull ? static_cast<std::size_t>(std::min<unsigned long long>(parsed, 4096ull)) : std::size_t{64};
+    }();
+    return entries;
+}
 constexpr std::size_t ColumnMemoWords = std::size_t{1} << 24u;
 
 std::vector<ColumnMemo>& ColumnMemos() {
@@ -1094,6 +1108,16 @@ private:
         }
         if (memoized && Reuse(key, column, records, true)) return;
         unread();
+        if (MaterializeProfiled()) {
+            auto& counters = tableCounters();
+            if (!memoized) {
+                counters.fullNotMemoized.fetch_add(1, std::memory_order_relaxed);
+            } else if (std::none_of(ColumnMemos().begin(), ColumnMemos().end(), [&](const ColumnMemo& entry) { return entry.key == key; })) {
+                counters.fullNoMemo.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                (comparedWords.empty() ? counters.fullUncompared : counters.fullDiffered).fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         std::shared_ptr<const ColumnLayout> layout;
         if (memoized && FlatWordsIndex()) {
             const auto& memos = ColumnMemos();
@@ -1340,7 +1364,7 @@ private:
         std::rotate(memos.begin(), found, found + 1);
         std::size_t kept = 0;
         std::size_t footprint = 0;
-        while (kept < memos.size() && kept < ColumnMemoEntries && footprint + memos[kept].Footprint() <= ColumnMemoWords) footprint += memos[kept++].Footprint();
+        while (kept < memos.size() && kept < ColumnMemoEntries() && footprint + memos[kept].Footprint() <= ColumnMemoWords) footprint += memos[kept++].Footprint();
         memos.resize(kept);
     }
 

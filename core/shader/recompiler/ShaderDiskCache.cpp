@@ -1356,6 +1356,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_TRACE_SPECIALIZATION",
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
+    "APS5_TABLE_MEMO_ENTRIES",
 };
 
 const std::vector<std::byte>& switchKey() {
