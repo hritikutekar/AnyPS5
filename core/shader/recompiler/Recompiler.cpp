@@ -2166,7 +2166,7 @@ std::uint64_t ResultHeapBytes(const RecompileResult& result) {
     bytes += vectorHeapBytes(result.specialization) + vectorHeapBytes(result.bindings) + vectorHeapBytes(result.pushConstants) + vectorHeapBytes(result.vertexAttributes);
     bytes += vectorHeapBytes(result.imageTablePoison) + vectorHeapBytes(result.imageTableRanges) + vectorHeapBytes(result.imageTableReadRanges) + vectorHeapBytes(result.bindlessTables);
     for (const auto& binding : result.bindings) {
-        bytes += vectorHeapBytes(binding.guestDescriptor) + vectorHeapBytes(binding.samplerDepthCompare) + vectorHeapBytes(binding.imageWritten);
+        bytes += vectorHeapBytes(binding.guestDescriptor) + vectorHeapBytes(binding.samplerDepthCompare) + vectorHeapBytes(binding.imageWritten) + vectorHeapBytes(binding.imageRead);
         bytes += vectorHeapBytes(binding.imageDepthCompare) + vectorHeapBytes(binding.imageAtomic) + vectorHeapBytes(binding.imageAtomic64) + vectorHeapBytes(binding.imageShapes);
         bytes += vectorHeapBytes(binding.bufferAtomic) + vectorHeapBytes(binding.bufferWritten) + vectorHeapBytes(binding.samplerUnnormalized) + vectorHeapBytes(binding.samplerIntegerBorder);
         bytes += vectorHeapBytes(binding.imageUnnormalized) + vectorHeapBytes(binding.imageUnnormalizedBaseLevel) + vectorHeapBytes(binding.imageSamplers) + vectorHeapBytes(binding.bufferRead);

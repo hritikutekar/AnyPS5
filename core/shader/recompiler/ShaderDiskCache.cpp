@@ -89,7 +89,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 240, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 560, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 864, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -423,6 +423,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Value(binding.imageShape.value_or(DescriptorImageShape::Image1D));
     writer.Flags(binding.samplerDepthCompare);
     writer.Flags(binding.imageWritten);
+    writer.Flags(binding.imageRead);
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
@@ -452,6 +453,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     binding.imageShape = hasShape ? std::optional(shape) : std::nullopt;
     reader.Flags(binding.samplerDepthCompare);
     reader.Flags(binding.imageWritten);
+    reader.Flags(binding.imageRead);
     reader.Flags(binding.imageDepthCompare);
     reader.Flags(binding.imageAtomic);
     reader.Flags(binding.imageAtomic64);
