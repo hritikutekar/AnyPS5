@@ -79,6 +79,10 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     // The first queued item write range over [address, address + bytes), or {0, 0} (diagnostics).
     Range FirstOverlap(std::uint64_t address, std::size_t bytes);
+    // Label items' enqueue-to-commit time and count (diagnostics, [q-split]).
+    static std::atomic<std::uint64_t>& LabelCommitNs();
+    static std::atomic<std::uint64_t>& LabelCommits();
+    static void NoteLabelCommit(std::int64_t ns);
     bool DrainIfOverlaps(std::span<const Range> ranges, DrainReason reason, std::uint32_t opcode = 0x100, std::source_location where = std::source_location::current()) {
         return DrainIfOverlaps(ranges, [](const Range& range) { return range; }, reason, opcode, where);
     }

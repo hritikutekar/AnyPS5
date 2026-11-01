@@ -153,6 +153,23 @@ bool DrawPipeline::PipelineIndirect() {
     return enabled;
 }
 
+// Diagnostic (APS5_PROFILE_DRAW): queue 0's label items, enqueue to commit (how long another ring waiting on such a
+// label waits for the committer before the store is even recorded); read by WaitMemory's [q-split] line.
+std::atomic<std::uint64_t>& DrawPipeline::LabelCommitNs() {
+    static std::atomic<std::uint64_t> total{0};
+    return total;
+}
+
+std::atomic<std::uint64_t>& DrawPipeline::LabelCommits() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+void DrawPipeline::NoteLabelCommit(std::int64_t ns) {
+    LabelCommitNs().fetch_add(static_cast<std::uint64_t>(std::max<std::int64_t>(0, ns)), std::memory_order_relaxed);
+    LabelCommits().fetch_add(1, std::memory_order_relaxed);
+}
+
 bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes, std::source_location where) {
     if (!Active()) return false;
     auto& pipeline = Queue0();
@@ -421,6 +438,7 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             lastPopNs = lastFinishNs = nowNs();
+            if (done.labelAddress != 0) NoteLabelCommit(lastFinishNs - done.pushedNs);
             if (items.empty()) idleStartActivity = std::min<std::uint8_t>(WorkerActivity().load(std::memory_order_relaxed), static_cast<std::uint8_t>(WorkerState::Count) - 1);
             outstanding.fetch_sub(1, std::memory_order_release);
             if (idleWaiters != 0) idle.notify_all();

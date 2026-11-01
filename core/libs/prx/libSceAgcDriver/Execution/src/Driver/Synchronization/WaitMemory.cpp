@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <map>
@@ -107,6 +110,27 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         stats = LandStats{};
     }
 }
+
+namespace {
+
+// Diagnostic (APS5_PROFILE_DRAW): every ring's blocked-wait time so far and whether it is blocked now, so a queue-0
+// wait that ends on ring R's label or store splits into "R was itself blocked" and "R was working" ([q-split]).
+struct RingBlocked {
+    std::atomic<std::int64_t> cumulativeNs{0};
+    std::atomic<std::int64_t> sinceNs{0};
+    std::atomic<std::uint32_t> producer{0xffffffffu};
+};
+
+std::array<RingBlocked, 256>& RingsBlocked() {
+    static std::array<RingBlocked, 256> rings;
+    return rings;
+}
+
+std::int64_t SteadyNs() {
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+} // namespace
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
@@ -346,8 +370,68 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::chrono::steady_clock::time_point begin;
         WaitEnd end = WaitEnd::Memory;
         std::uint32_t producer = 0xffffffffu;
+        // [q-split]: the rings' blocked time when this queue-0 wait began.
+        std::int64_t beginNs = 0;
+        std::array<std::int64_t, 256> cumulativeAtBegin{};
+        std::array<std::int64_t, 256> sinceAtBegin{};
+        void Begin() {
+            if (!enabled || queue >= 256) return;
+            beginNs = SteadyNs();
+            auto& rings = RingsBlocked();
+            rings[queue].sinceNs.store(beginNs, std::memory_order_relaxed);
+            if (queue != 0) return;
+            for (std::size_t ring = 0; ring < rings.size(); ++ring) {
+                cumulativeAtBegin[ring] = rings[ring].cumulativeNs.load(std::memory_order_relaxed);
+                sinceAtBegin[ring] = rings[ring].sinceNs.load(std::memory_order_relaxed);
+            }
+        }
+        void Split(std::int64_t endNs) {
+            auto& rings = RingsBlocked();
+            if (queue < 256) {
+                rings[queue].cumulativeNs.fetch_add(endNs - beginNs, std::memory_order_relaxed);
+                rings[queue].sinceNs.store(0, std::memory_order_relaxed);
+                rings[queue].producer.store(producer, std::memory_order_relaxed);
+            }
+            if (queue != 0 || (end != WaitEnd::Label && end != WaitEnd::Store) || producer >= 256 || producer == 0) return;
+            const auto total = endNs - beginNs;
+            auto blocked = rings[producer].cumulativeNs.load(std::memory_order_relaxed) - cumulativeAtBegin[producer];
+            if (sinceAtBegin[producer] != 0) blocked -= beginNs - sinceAtBegin[producer];
+            if (const auto since = rings[producer].sinceNs.load(std::memory_order_relaxed); since != 0) blocked += endNs - std::max(since, beginNs);
+            blocked = std::clamp<std::int64_t>(blocked, 0, total);
+            struct Ring { std::uint64_t waits = 0; std::int64_t totalNs = 0, blockedNs = 0; std::map<std::uint32_t, std::uint64_t> on; };
+            static std::mutex mutex;
+            static std::map<std::uint32_t, Ring> split;
+            static auto last = std::chrono::steady_clock::now();
+            std::lock_guard lock(mutex);
+            auto& ring = split[producer];
+            ++ring.waits;
+            ring.totalNs += total;
+            ring.blockedNs += blocked;
+            ++ring.on[rings[producer].producer.load(std::memory_order_relaxed)];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::seconds(10)) return;
+            last = now;
+            const auto labelNs = DrawPipeline::LabelCommitNs().exchange(0, std::memory_order_relaxed);
+            const auto labels = DrawPipeline::LabelCommits().exchange(0, std::memory_order_relaxed);
+            char head[160];
+            std::snprintf(head, sizeof(head), "[q-split] (10 s) queue 0's waits ended by ring R's label or store; queue 0 label items enqueue->commit %llu x %.0f us:", static_cast<unsigned long long>(labels), labels != 0 ? static_cast<double>(labelNs) / 1e3 / static_cast<double>(labels) : 0.0);
+            std::string line = head;
+            for (const auto& [from, value] : split) {
+                char item[200];
+                std::snprintf(item, sizeof(item), " R=0x%x %llu waits %.0f ms = R blocked %.0f + R working %.0f (R's last wait on:", from, static_cast<unsigned long long>(value.waits), static_cast<double>(value.totalNs) / 1e6, static_cast<double>(value.blockedNs) / 1e6, static_cast<double>(value.totalNs - value.blockedNs) / 1e6);
+                line += item;
+                for (const auto& [on, count] : value.on) {
+                    std::snprintf(item, sizeof(item), " 0x%x x%llu", on == 0xffffffffu ? 0xffu : on, static_cast<unsigned long long>(count));
+                    line += item;
+                }
+                line += ");";
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+            split.clear();
+        }
         ~Q0WaitNote() {
             if (!enabled) return;
+            Split(SteadyNs());
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             if (ms < 0.5) return;
             struct Bucket { std::uint64_t count = 0; double ms = 0.0, maxMs = 0.0; };
@@ -376,6 +460,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     static const bool q0WaitProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     Q0WaitNote q0Wait{q0WaitProfile, queue, std::chrono::steady_clock::now()};
+    q0Wait.Begin();
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
