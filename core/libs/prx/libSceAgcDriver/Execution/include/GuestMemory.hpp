@@ -119,6 +119,14 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
+// Diagnostic (APS5_PROFILE_DRAW), sizing "record past cross-ring waits" ([spec-hazard] every 10 s): while a ring is
+// blocked on another ring's label (SpecWindowBegin/SpecWindowEnd), the driver stores (MarkWritten) other rings' threads
+// make are kept; for as long again after the wait, every write-tracker query by the waiting ring's recording threads
+// (SpecMarkReader: its worker; the draw committer for queue 0, kind 1) is checked against them. A hit is a read that,
+// recorded ahead of the wait, would have run before that store was known.
+void SpecMarkReader(std::uint32_t ring, int kind);
+void SpecWindowBegin(std::uint32_t ring);
+void SpecWindowEnd(std::uint32_t ring, bool crossRing, std::uint32_t producer, std::int64_t durationNs);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);

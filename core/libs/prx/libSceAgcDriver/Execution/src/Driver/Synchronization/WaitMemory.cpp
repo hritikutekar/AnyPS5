@@ -9,6 +9,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include <array>
+#include <unordered_set>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -131,6 +132,31 @@ std::int64_t SteadyNs() {
 }
 
 } // namespace
+
+namespace {
+// CEILING EXPERIMENT ONLY (renders wrong on purpose; never a default): APS5_CEILING_NO_CROSS_WAIT=1 learns the addresses
+// whose blocked waits were ended by ANOTHER ring's label or store, and from then on returns from an unsatisfied wait on
+// such an address at once: the waiting ring records ahead of its producer (wrong GPU order, wrong data). It measures the
+// most that breaking the cross-ring chain (record-ahead) could save.
+bool CeilingNoCrossWait() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_CEILING_NO_CROSS_WAIT");
+        const bool on = value != nullptr && *value == '1';
+        if (on) std::fprintf(stderr, "[ceiling] APS5_CEILING_NO_CROSS_WAIT=1: cross-ring waits skipped once learned (rendering is WRONG on purpose)\n");
+        return on;
+    }();
+    return enabled;
+}
+std::mutex& CrossWaitMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::unordered_set<std::uint64_t>& CrossWaitAddresses() {
+    static auto* addresses = new std::unordered_set<std::uint64_t>;
+    return *addresses;
+}
+std::atomic<std::uint64_t> crossWaitsSkipped{0};
+}
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
@@ -370,6 +396,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::chrono::steady_clock::time_point begin;
         WaitEnd end = WaitEnd::Memory;
         std::uint32_t producer = 0xffffffffu;
+        std::uint64_t address = 0;
         // [q-split]: the rings' blocked time when this queue-0 wait began.
         std::int64_t beginNs = 0;
         std::array<std::int64_t, 256> cumulativeAtBegin{};
@@ -379,6 +406,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             beginNs = SteadyNs();
             auto& rings = RingsBlocked();
             rings[queue].sinceNs.store(beginNs, std::memory_order_relaxed);
+            GuestMemory::SpecMarkReader(queue, 0);
+            GuestMemory::SpecWindowBegin(queue);
             if (queue != 0) return;
             for (std::size_t ring = 0; ring < rings.size(); ++ring) {
                 cumulativeAtBegin[ring] = rings[ring].cumulativeNs.load(std::memory_order_relaxed);
@@ -392,6 +421,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 rings[queue].sinceNs.store(0, std::memory_order_relaxed);
                 rings[queue].producer.store(producer, std::memory_order_relaxed);
             }
+            GuestMemory::SpecWindowEnd(queue, (end == WaitEnd::Label || end == WaitEnd::Store) && producer < 256 && producer != queue, producer, endNs - beginNs);
             if (queue != 0 || (end != WaitEnd::Label && end != WaitEnd::Store) || producer >= 256 || producer == 0) return;
             const auto total = endNs - beginNs;
             auto blocked = rings[producer].cumulativeNs.load(std::memory_order_relaxed) - cumulativeAtBegin[producer];
@@ -430,6 +460,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             split.clear();
         }
         ~Q0WaitNote() {
+            if (CeilingNoCrossWait() && (end == WaitEnd::Label || end == WaitEnd::Store) && producer < 256 && producer != queue) {
+                std::lock_guard lock(CrossWaitMutex());
+                CrossWaitAddresses().insert(address);
+            }
             if (!enabled) return;
             Split(SteadyNs());
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
@@ -458,8 +492,21 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             buckets.clear();
         }
     };
+    if (CeilingNoCrossWait()) {
+        bool learned = false;
+        {
+            std::lock_guard lock(CrossWaitMutex());
+            learned = CrossWaitAddresses().contains(awaited);
+        }
+        if (learned) {
+            const auto skipped = crossWaitsSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((skipped & 0x3fffu) == 0) std::fprintf(stderr, "[ceiling] %llu cross-ring waits skipped\n", static_cast<unsigned long long>(skipped));
+            return;
+        }
+    }
     static const bool q0WaitProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     Q0WaitNote q0Wait{q0WaitProfile, queue, std::chrono::steady_clock::now()};
+    q0Wait.address = awaited;
     q0Wait.Begin();
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;

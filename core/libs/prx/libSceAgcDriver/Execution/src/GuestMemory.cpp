@@ -1596,11 +1596,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 }
 
+namespace {
+void specNoteRead(std::uint64_t address, std::size_t bytes);
+}
+
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
+    specNoteRead(address, bytes);
     return collectWrites(address, bytes, true);
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
+    specNoteRead(address, bytes);
     return collectWrites(address, bytes, false);
 }
 
@@ -1821,6 +1827,7 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
 }
 
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    specNoteRead(address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -1830,6 +1837,7 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
+    for (const auto& query : queries) specNoteRead(query.address, query.bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1842,6 +1850,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    specNoteRead(address, bytes);
     ranges.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !WriteWatched()) return 0;
     auto committed = CommittedRanges(address, bytes);
@@ -1942,7 +1951,149 @@ void traceMarkWritten(std::uint64_t address, std::size_t bytes, const void* call
 }
 }
 
+namespace {
+// [spec-hazard] state (see SpecWindowBegin in GuestMemory.hpp): one window per waiting ring.
+struct SpecWindow {
+    bool open = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> window;   // [begin, end) stored by other rings in the open window
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fresh;    // the last cross-ring window's stores, checked until freshUntil
+    std::int64_t freshUntil = 0;
+    std::uint64_t freshWait = 0, hitWait = 0, waitSerial = 0;
+    std::uint32_t freshProducer = 0;
+};
+struct SpecPair {
+    std::uint64_t waits = 0, withStores = 0, withHits = 0, reads = 0, hits = 0, storeRanges = 0, overflow = 0;
+    std::map<std::uint64_t, std::uint64_t> hitRanges;
+};
+struct SpecState {
+    std::mutex mutex;
+    std::atomic<int> openCount{0};
+    std::atomic<int> freshCount{0};
+    std::array<SpecWindow, 256> windows;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, SpecPair> pairs;   // (waiting ring, producer ring)
+    std::uint64_t committerReads = 0, committerHits = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+SpecState& Spec() {
+    static auto* state = new SpecState;
+    return *state;
+}
+thread_local int specRing = -1;
+thread_local int specKind = 0;
+bool SpecProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_SPEC_HAZARD") == nullptr;
+    return enabled;
+}
+std::int64_t SpecNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void specNoteStore(std::uint64_t address, std::size_t bytes) {
+    if (!SpecProfiled() || bytes == 0) return;
+    auto& spec = Spec();
+    if (spec.openCount.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(spec.mutex);
+    for (std::size_t ring = 0; ring < spec.windows.size(); ++ring) {
+        auto& window = spec.windows[ring];
+        if (!window.open || static_cast<int>(ring) == specRing) continue;
+        if (window.window.size() >= 16384) continue;
+        window.window.emplace_back(address, address + bytes);
+    }
+}
+void specNoteRead(std::uint64_t address, std::size_t bytes) {
+    if (specRing < 0 || bytes == 0) return;
+    auto& spec = Spec();
+    if (spec.freshCount.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(spec.mutex);
+    auto& window = spec.windows[static_cast<std::size_t>(specRing)];
+    if (window.fresh.empty()) return;
+    if (SpecNowNs() > window.freshUntil) {
+        window.fresh.clear();
+        spec.freshCount.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
+    auto& pair = spec.pairs[{static_cast<std::uint32_t>(specRing), window.freshProducer}];
+    ++pair.reads;
+    if (specKind == 1) ++spec.committerReads;
+    const auto end = address + bytes;
+    for (const auto& [from, to] : window.fresh) {
+        if (from < end && address < to) {
+            ++pair.hits;
+            if (specKind == 1) ++spec.committerHits;
+            ++pair.hitRanges[from];
+            if (window.hitWait != window.freshWait) {
+                window.hitWait = window.freshWait;
+                ++pair.withHits;
+            }
+            break;
+        }
+    }
+}
+}
+
+void SpecMarkReader(std::uint32_t ring, int kind) {
+    specRing = ring < 256 ? static_cast<int>(ring) : -1;
+    specKind = kind;
+}
+
+void SpecWindowBegin(std::uint32_t ring) {
+    if (!SpecProfiled() || ring >= 256) return;
+    auto& spec = Spec();
+    std::lock_guard lock(spec.mutex);
+    auto& window = spec.windows[ring];
+    window.window.clear();
+    if (!window.open) spec.openCount.fetch_add(1, std::memory_order_relaxed);
+    window.open = true;
+}
+
+void SpecWindowEnd(std::uint32_t ring, bool crossRing, std::uint32_t producer, std::int64_t durationNs) {
+    if (!SpecProfiled() || ring >= 256) return;
+    auto& spec = Spec();
+    std::lock_guard lock(spec.mutex);
+    auto& window = spec.windows[ring];
+    if (window.open) spec.openCount.fetch_sub(1, std::memory_order_relaxed);
+    window.open = false;
+    if (crossRing) {
+        auto& pair = spec.pairs[{ring, producer}];
+        ++pair.waits;
+        if (!window.window.empty()) {
+            ++pair.withStores;
+            pair.storeRanges += window.window.size();
+            if (window.window.size() >= 16384) ++pair.overflow;
+        }
+        const bool hadFresh = !window.fresh.empty();
+        window.fresh.swap(window.window);
+        window.freshUntil = SpecNowNs() + durationNs;
+        window.freshWait = ++window.waitSerial;
+        window.freshProducer = producer;
+        if (hadFresh && window.fresh.empty()) spec.freshCount.fetch_sub(1, std::memory_order_relaxed);
+        if (!hadFresh && !window.fresh.empty()) spec.freshCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    window.window.clear();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - spec.last < std::chrono::seconds(10)) return;
+    spec.last = now;
+    std::string line = "[spec-hazard] (10 s) cross-ring waits by waiting<-producer ring: waits / with other-ring driver stores / with a hit, reads after (hits), top hit stores:";
+    char item[200];
+    for (auto& [key, pair] : spec.pairs) {
+        if (pair.waits < 20) continue;
+        std::snprintf(item, sizeof(item), " | 0x%x<-0x%x %llu/%llu/%llu, %llu (%llu)", key.first, key.second, static_cast<unsigned long long>(pair.waits), static_cast<unsigned long long>(pair.withStores), static_cast<unsigned long long>(pair.withHits), static_cast<unsigned long long>(pair.reads), static_cast<unsigned long long>(pair.hits));
+        line += item;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> top(pair.hitRanges.begin(), pair.hitRanges.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (std::size_t k = 0; k < top.size() && k < 3; ++k) {
+            std::snprintf(item, sizeof(item), " 0x%llx x%llu", static_cast<unsigned long long>(top[k].first), static_cast<unsigned long long>(top[k].second));
+            line += item;
+        }
+    }
+    std::snprintf(item, sizeof(item), " | queue 0 committer reads %llu (%llu hits)", static_cast<unsigned long long>(spec.committerReads), static_cast<unsigned long long>(spec.committerHits));
+    line += item;
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    spec.pairs.clear();
+    spec.committerReads = spec.committerHits = 0;
+}
+
 __attribute__((noinline)) std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    specNoteStore(address, bytes);
     traceMarkWritten(address, bytes, __builtin_return_address(0));
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -1983,6 +2134,7 @@ __attribute__((noinline)) std::uint64_t MarkWritten(std::uint64_t address, std::
 }
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    specNoteRead(address, bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2221,6 +2373,7 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 }
 
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    specNoteRead(address, bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2234,6 +2387,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 }
 
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
+    specNoteRead(address, bytes);
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();

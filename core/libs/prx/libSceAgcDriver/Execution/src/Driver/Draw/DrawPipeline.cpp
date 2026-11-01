@@ -385,6 +385,7 @@ void DrawPipeline::run() {
     NameCurrentThread("commit");
     NoteCriticalThread(CriticalThread::Committer);
     StartCommitterSampler();
+    GuestMemory::SpecMarkReader(0, 1);
     for (;;) {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
