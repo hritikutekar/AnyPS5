@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -297,6 +298,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
     }
     if (partialLastGroup) compute.partialThreads = partialGroups;
+    // B1: a partial dispatch (a thread count that is no multiple of the group) never counts as covering an image.
+    if (indirectArguments == 0) Graphics::NoteProgramThreads(address, (packet[4] & 0x20u) == 0 && !partialLastGroup ? compute.numThreads[0] : 0u, (packet[4] & 0x20u) == 0 && !partialLastGroup ? compute.numThreads[1] : 0u);
     // One workgroup (direct, 1x1x1 groups, or a thread count inside one group): workgroup-scope
     // coherence for its glc reads (ShaderComputeStageInfo::singleWorkgroup). Opt-in, APS5_SINGLE_GROUP_COHERENCE=1:
     // with the BDA overlays (device-local buffers) it saves ~2 % of 0x80001c0d00 on the request bench, and one

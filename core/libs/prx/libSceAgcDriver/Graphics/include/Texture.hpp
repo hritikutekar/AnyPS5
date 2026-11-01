@@ -23,6 +23,25 @@
 
 namespace AgcDriver::Graphics {
 
+// Diagnostic: the binding use of the storage lookup in progress ([storage-use]): 0 other, 1 write-only, 2 read.
+void SetStorageUse(int use);
+// B1 dead alias transitions: the threads of the dispatch being resolved (DispatchExtentScope, set by VulkanDevice's
+// dispatch paths; none while a draw resolves) and whether a write-only storage element covering its image takes the
+// refresh as an overwrite (SetStorageOverwrite around its Refresh): no upload of the memory's previous bytes, and
+// other images' pending results inside its elements dropped instead of written back. APS5_NO_DEAD_STORAGE_TRANSITION=1
+// refreshes as before.
+struct DispatchExtentScope {
+    DispatchExtentScope(std::uint32_t threadsX, std::uint32_t threadsY);
+    ~DispatchExtentScope();
+    std::uint32_t previousX, previousY;
+};
+bool DeadStorageTransitions();
+// A compute program's threads per group as its dispatches set them (0 when it was seen with different counts).
+void NoteProgramThreads(std::uint64_t program, std::uint32_t x, std::uint32_t y);
+std::pair<std::uint32_t, std::uint32_t> ProgramThreads(std::uint64_t program);
+bool DispatchCovers(std::uint32_t width, std::uint32_t height);
+void SetStorageOverwrite(bool overwrite);
+
 class Buffer;
 class ResidentColor;
 class CommandBatch;

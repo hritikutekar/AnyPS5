@@ -170,7 +170,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         return;
     }
     storeClearTexels(context, color, texel);
-    resident.Refresh();
+    { SetStorageUse(3); resident.Refresh(); SetStorageUse(0); }
 }
 
 enum class CmaskState { Expanded, Cleared, Partial };
@@ -305,7 +305,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const bool filled = state == CmaskState::Cleared && color.mipCount == 1 && resident != nullptr && clearToTexel(*resident, texel, color.elementBytes, refusal);
     if (!filled) {
         storeCmaskClearTexels(color, layout, state == CmaskState::Cleared ? nullptr : &cleared, texel);
-        if (resident != nullptr) resident->Refresh();
+        if (resident != nullptr) { SetStorageUse(3); resident->Refresh(); SetStorageUse(0); }
     }
     const std::vector<std::byte> expanded(bytes, std::byte{0xff});
     GuestMemory::Write(color.cmaskAddress, expanded, CmaskLayout::Alignment);
@@ -3866,7 +3866,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, state.colors[index].dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
-            stored->Refresh();
+            { SetStorageUse(3); stored->Refresh(); SetStorageUse(0); }
             return stored;
         });
         timer.phase(PhaseReadTarget);
@@ -3975,7 +3975,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         if (keys == DccKeys::ClearSingle) {
             Require(pass.mode == ColorMetadataPass::Mode::DccDecompress, "CB fast-clear eliminate over comp-to-single DCC keys (whether it expands them is not modeled)");
             storeSingleTexels(context, color);
-            if (const auto resident = metadataPassResident(context, color)) resident->Refresh();
+            if (const auto resident = metadataPassResident(context, color)) { SetStorageUse(3); resident->Refresh(); SetStorageUse(0); }
             continue;
         }
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");

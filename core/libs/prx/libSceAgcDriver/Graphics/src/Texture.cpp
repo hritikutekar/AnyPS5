@@ -29,6 +29,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <execinfo.h>
+#include <map>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -121,6 +123,12 @@ thread_local const char* flushReason = nullptr;
 // (units taken from an alias image on the device); set by the constructor and Refresh around
 // upload() and borrowUnits().
 thread_local const char* uploadReason = "first";
+// Diagnostic (APS5_PROFILE_DRAW, [storage-use] every 10 s): the binding use around the current storage lookup (0 other,
+// 1 write-only: written and not read by the shader, 2 read), set by ShaderResources through SetStorageUse; storage
+// uploads and write-backs are counted by it, to size skipping the dead alias transitions of write-only first uses.
+thread_local int storageUse = 0;
+std::atomic<std::uint64_t> useUploads[5]{}, useUploadBytes[5]{}, useWriteBacks[5]{}, useWriteBackBytes[5]{};
+std::atomic<std::uint64_t> overwriteRefreshes{0}, overwriteUploadsSkipped{0}, overwriteUnitsDropped{0};
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -173,10 +181,44 @@ StorageTraffic& Traffic() {
     return traffic;
 }
 
+// [storage-use] "other": the call chains (library offsets of frames 2..7) of storage traffic outside a classified use.
+std::mutex otherCallersMutex;
+std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> otherCallers;   // chain -> (bytes up, bytes back)
+void noteOtherCaller(std::uint64_t bytes, bool upload) {
+    void* frames[9];
+    const int count = backtrace(frames, 9);
+    std::string chain;
+    char item[24];
+    for (int i = 2; i < count; ++i) {
+        std::snprintf(item, sizeof(item), " %llx", static_cast<unsigned long long>(GuestMemory::CodeOffset(frames[i])));
+        chain += item;
+    }
+    std::lock_guard lock(otherCallersMutex);
+    auto& entry = otherCallers[chain];
+    (upload ? entry.first : entry.second) += bytes;
+}
 void reportStorageTraffic(StorageTraffic& traffic) {
     const auto now = std::chrono::steady_clock::now();
     if (now - traffic.lastReport < std::chrono::seconds(10)) return;
     traffic.lastReport = now;
+    {
+        static constexpr const char* useNames[5] = {"other", "storage write-only", "storage read", "render/depth target", "sampled"};
+        std::string uses = "[storage-use] (10 s) dead transitions: " + std::to_string(overwriteRefreshes.exchange(0)) + " overwrite refreshes, " + std::to_string(overwriteUploadsSkipped.exchange(0)) + " uploads skipped, " + std::to_string(overwriteUnitsDropped.exchange(0)) + " pending units dropped; storage uploads / write-backs by the binding use of the lookup that caused them:";
+        char item[160];
+        for (std::size_t use = 0; use < 5; ++use) {
+            std::snprintf(item, sizeof(item), " %s %llu/%.1f MiB up, %llu/%.1f MiB back;", useNames[use], static_cast<unsigned long long>(useUploads[use].exchange(0)), useUploadBytes[use].exchange(0) / 1048576.0, static_cast<unsigned long long>(useWriteBacks[use].exchange(0)), useWriteBackBytes[use].exchange(0) / 1048576.0);
+            uses += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", uses.c_str());
+        std::vector<std::pair<std::uint64_t, std::string>> top;
+        {
+            std::lock_guard lock(otherCallersMutex);
+            for (const auto& [chain, value] : otherCallers) top.emplace_back(value.first + value.second, chain + " up " + std::to_string(value.first >> 20) + " MiB back " + std::to_string(value.second >> 20) + " MiB");
+            otherCallers.clear();
+        }
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (std::size_t k = 0; k < top.size() && k < 8; ++k) AgcDriver::ProfilePrint_nid_no_patch("[storage-use] other #%zu:%s\n", k + 1, top[k].second.c_str());
+    }
     static constexpr const char* uploadNames[4] = {"clear", "direct", "cpu", "alias"};
     std::string line;
     char text[96];
@@ -222,6 +264,9 @@ void reportStorageTraffic(StorageTraffic& traffic) {
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes, const GuestTextureResource& surface) {
     if (!LookupOutcomes::Profiled()) return;
+    useUploads[storageUse].fetch_add(1, std::memory_order_relaxed);
+    useUploadBytes[storageUse].fetch_add(bytes, std::memory_order_relaxed);
+    if (storageUse == 0) noteOtherCaller(bytes, true);
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
     ++traffic.uploads[path].first;
@@ -238,6 +283,9 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes, const GuestTextur
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct, const GuestTextureResource& surface) {
     if (!LookupOutcomes::Profiled()) return;
+    useWriteBacks[storageUse].fetch_add(1, std::memory_order_relaxed);
+    useWriteBackBytes[storageUse].fetch_add(bytes, std::memory_order_relaxed);
+    if (storageUse == 0) noteOtherCaller(bytes, false);
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
     auto& totals = traffic.writeBacks[flushReason != nullptr ? flushReason : "other"];
@@ -2463,7 +2511,72 @@ void NoteFlushWait(const char* reason, const char* kind, const char* why, double
     waits.clear();
 }
 
+namespace {
+thread_local std::uint32_t dispatchThreadsX = 0, dispatchThreadsY = 0;
+thread_local bool storageOverwrite = false;
+}
+
+DispatchExtentScope::DispatchExtentScope(std::uint32_t threadsX, std::uint32_t threadsY) : previousX(dispatchThreadsX), previousY(dispatchThreadsY) {
+    dispatchThreadsX = threadsX;
+    dispatchThreadsY = threadsY;
+}
+
+DispatchExtentScope::~DispatchExtentScope() {
+    dispatchThreadsX = previousX;
+    dispatchThreadsY = previousY;
+}
+
+bool DeadStorageTransitions() {
+    static const bool enabled = std::getenv("APS5_NO_DEAD_STORAGE_TRANSITION") == nullptr;
+    return enabled;
+}
+
+namespace {
+std::mutex programThreadsMutex;
+std::unordered_map<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>> programThreads;
+}
+
+void NoteProgramThreads(std::uint64_t program, std::uint32_t x, std::uint32_t y) {
+    std::lock_guard lock(programThreadsMutex);
+    auto [it, added] = programThreads.try_emplace(program, x, y);
+    if (!added && it->second != std::pair{x, y}) it->second = {0u, 0u};
+}
+
+std::pair<std::uint32_t, std::uint32_t> ProgramThreads(std::uint64_t program) {
+    std::lock_guard lock(programThreadsMutex);
+    const auto found = programThreads.find(program);
+    return found != programThreads.end() ? found->second : std::pair{0u, 0u};
+}
+
+bool DispatchCovers(std::uint32_t width, std::uint32_t height) {
+    return dispatchThreadsX != 0 && dispatchThreadsX >= width && dispatchThreadsY >= height;
+}
+
+void SetStorageOverwrite(bool overwrite) {
+    storageOverwrite = overwrite;
+}
+
+void SetStorageUse(int use) {
+    storageUse = use;
+}
+
+namespace {
+// CEILING EXPERIMENT ONLY (renders wrong on purpose; never a default): APS5_CEILING_NO_COHERENCE=1 skips storage-image
+// coherence: Refresh treats the image as current (no flush of other images, no upload) and FlushPending writes nothing
+// back, so storage results never reach guest memory. It measures the most that keeping surfaces on the GPU could save.
+bool CeilingNoCoherence() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_CEILING_NO_COHERENCE");
+        const bool on = value != nullptr && *value == '1';
+        if (on) std::fprintf(stderr, "[ceiling] APS5_CEILING_NO_COHERENCE=1: storage refresh and write-back skipped (rendering is WRONG on purpose)\n");
+        return on;
+    }();
+    return enabled;
+}
+}
+
 bool StorageTexture::Refresh() {
+    if (CeilingNoCoherence()) return true;
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -2556,6 +2669,12 @@ bool StorageTexture::Refresh() {
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr ? clearHandOver() : std::nullopt;
+    // B1: an overwrite (a write-only use covering the image) makes other images' results inside its elements dead.
+    const bool overwrite = storageOverwrite && descriptor.dccAddress == 0 && !handOverKeys.has_value();
+    if (overwrite) {
+        overwriteRefreshes.fetch_add(1, std::memory_order_relaxed);
+        overwriteUnitsDropped.fetch_add(DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(elementExtent)), std::memory_order_relaxed);
+    }
     const bool flushed = !handOverKeys.has_value() && FlushPending(descriptor.baseAddress, static_cast<std::size_t>(elementExtent), alias.get(), "storage refresh", PublishScope::None);
     if (profile) NoteRefreshOutcome(flushed, alias != nullptr, aliasRejected, overlapKind);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -3143,6 +3262,21 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
+    if (storageOverwrite && descriptor.dccAddress == 0 && layers == nullptr) {
+        // B1: the use overwrites every element; the memory's previous bytes are never observed, so nothing is uploaded
+        // (bookkeeping as for a recorded fast clear, without the clear).
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            layerOriginal.assign(trackedLayers, false);
+            cancelStoredSaves();
+        } else {
+            captureGuestBytes(nullptr);
+        }
+        forgetBorrowed(0, trackedLayers);
+        stampLayers(false);
+        ++version;
+        overwriteUploadsSkipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     VkClearColorValue clearValue{};
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
@@ -4373,6 +4507,10 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+    if (CeilingNoCoherence()) {
+        if (published != nullptr) *published = false;
+        return false;
+    }
     {
         const auto outer = std::exchange(depthPlaneOuterReason, reason);
         struct Restore {

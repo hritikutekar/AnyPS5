@@ -1387,7 +1387,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto generation = GuestMemory::CollectWrites(address, bytes);
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
-        source->Refresh();
+        { SetStorageUse(4); source->Refresh(); SetStorageUse(0); }
     }
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
     // after them is current at the generation of a second (memoized) collect. The store marks the
@@ -1541,7 +1541,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
             if (!stagedFlushed && (source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
-                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) { SetStorageUse(4); it->source->Refresh(); SetStorageUse(0); }
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -4481,7 +4481,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
             if (found != source) return OwnRefreshFallback::ForeignView;
             if (!GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
                 countOwnRefresh(false);
-                source->Refresh();
+                { SetStorageUse(4); source->Refresh(); SetStorageUse(0); }
             }
             return OwnRefreshFallback::Count;
         }
@@ -4490,7 +4490,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         countOwnRefresh(false);
         // The cache's image of the key is this source while it is cached (an entry is replaced
         // only after its image left the cache), so the lookup would refresh and return it.
-        source->Refresh();
+        { SetStorageUse(4); source->Refresh(); SetStorageUse(0); }
         return OwnRefreshFallback::Count;
     };
     // A storage element's lookup (cachedStorageTexture): the cached image of its surface key,
@@ -4500,7 +4500,14 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         if (image == nullptr || !image->Cached()) return OwnRefreshFallback::Uncached;
         if (i >= storageKeys.size() || !StorageImageServesKeys(*image, storageKeys[i])) return OwnRefreshFallback::Keys;
         countOwnRefresh(true);
+        const bool writeOnly = i < storageWriteOnly.size() && storageWriteOnly[i];
+        SetStorageUse(writeOnly ? 1 : 2);
+        const auto mip = i < storageMips.size() ? storageMips[i] : 0u;
+        const auto& shape = image->Descriptor();
+        SetStorageOverwrite(writeOnly && DeadStorageTransitions() && DispatchCovers(std::max(1u, shape.width >> mip), std::max(1u, shape.height >> mip)));
         image->Refresh();
+        SetStorageOverwrite(false);
+        SetStorageUse(0);
         return OwnRefreshFallback::Count;
     };
     std::size_t textureIndex = 0;
@@ -6137,6 +6144,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             storageKeys.push_back(0);
             storageFirstLayer.push_back(false);
             storageWritten.push_back(false);
+            storageWriteOnly.push_back(false);
             storageAtomic.push_back(false);
             storageAtomic64.push_back(false);
             item.imageAllocations.push_back(storageTextures.size() - 1);
@@ -6150,12 +6158,18 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         // Images the shader only reads have nothing to store back.
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
         // The same surface as the previous element: its image was just looked up and refreshed.
+        const bool read = element >= binding.imageRead.size() || binding.imageRead[element];
+        SetStorageUse(written && !read ? 1 : 2);
+        SetStorageOverwrite(written && !read && DeadStorageTransitions() && DispatchCovers(std::max(1u, resource.width >> mip), std::max(1u, resource.height >> mip)));
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        SetStorageOverwrite(false);
+        SetStorageUse(0);
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
         storageWritten.push_back(written);
+        storageWriteOnly.push_back(written && !read);
         storageAtomic.push_back(element < binding.imageAtomic.size() && binding.imageAtomic[element]);
         storageAtomic64.push_back(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]);
         describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
@@ -6359,6 +6373,7 @@ void ShaderResources::resolveStorageImageTables() {
                 storageKeys.push_back(resource.dccAddress);
                 storageFirstLayer.push_back(false);
                 storageWritten.push_back(true);
+                storageWriteOnly.push_back(false);
                 storageAtomic.push_back(false);
                 storageAtomic64.push_back(false);
                 describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress, true});

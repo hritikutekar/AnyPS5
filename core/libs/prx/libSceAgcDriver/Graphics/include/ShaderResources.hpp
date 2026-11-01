@@ -721,6 +721,8 @@ private:
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
+    // Per storage element: written and not read by the shader ([storage-use] diagnostic).
+    std::vector<bool> storageWriteOnly;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
     std::vector<std::shared_ptr<Sampler>> samplers;
