@@ -1274,9 +1274,23 @@ void boundOverflow(const Context& context) {
     }
 }
 
+// Heap storage images (NoteImageSurfaceUse): the surface's guest bytes, its described size when the caller has none.
+void noteImageSurface(ImageSurfaceUse use, const GuestTextureResource& resource, std::uint64_t guestBytes) {
+    if (guestBytes == 0) {
+        if (ImageSurfaceNoted(resource.baseAddress)) return;
+        try {
+            guestBytes = DescribeSurface(resource).guestBytes;
+        } catch (const std::exception&) {
+            return;
+        }
+    }
+    NoteImageSurfaceUse(use, resource.baseAddress, guestBytes);
+}
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
+    noteImageSurface(ImageSurfaceUse::Sampled, requested, guestBytes);
     if (resource.dimension == TextureDimension::k2DMsaa) {
         Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
         if (auto depth = DepthSurfaceTexture(context, words, resource, components, multisampleViewType)) {
@@ -2085,6 +2099,7 @@ static WrittenStorage WrittenStorageBytes(const GuestTextureResource& viewed, st
 std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written) {
+    noteImageSurface(ImageSurfaceUse::ImageStorage, requested, guestBytes);
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (viewed.baseAddress != requested.baseAddress) guestBytes = 0;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -3138,6 +3153,15 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 else guestMemory.AddReadable(range.begin, static_cast<std::size_t>(range.end - range.begin));
             }
             if (!shader.program->heapImageRanges.empty()) CountHeapImageRanges(shader.program->heapImageRanges);
+            static const bool surfaceTrace = std::getenv("APS5_HEAP_SURFACE_TRACE") != nullptr;
+            if (surfaceTrace) {
+                static std::mutex traceMutex;
+                static std::set<std::tuple<std::uint64_t, std::uint64_t, bool>> traced;
+                std::lock_guard traceLock(traceMutex);
+                for (const auto& range : shader.program->heapImageRanges) {
+                    if (traced.emplace(range.begin, range.end, range.written).second) std::fprintf(stderr, "[heap-storage] HEAP 0x%llx+0x%llx %s\n", static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end - range.begin), range.written ? "stored" : "loaded");
+                }
+            }
             std::uint64_t stageStorageBuffers = 0;
             std::uint64_t stageResources = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? colorAttachments : 0;
             Require(stageResources <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");

@@ -58,6 +58,13 @@ bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t 
 // registered guest allocation) that no live depth surface of any device overlaps (a depth plane is kept apart from
 // guest memory: a texel stored or loaded through the heap would miss it).
 bool HeapRangeServedInPlace(std::uint64_t begin, std::uint64_t end);
+// Heap storage images are for storage-only surfaces: a guest range ever bound as a render target, a sampled texture or
+// an image-path storage image (the driver keeps its own image of those bytes, with keys and shadows a heap store does
+// not update) is noted here and never taken by the heap path afterwards. APS5_NO_HEAP_STORAGE_ONLY=1: no such filter.
+enum class ImageSurfaceUse { RenderTarget, Sampled, ImageStorage };
+void NoteImageSurfaceUse(ImageSurfaceUse use, std::uint64_t address, std::uint64_t bytes);
+// A surface at `address` was noted already (or the filter is off): a caller can skip sizing it.
+bool ImageSurfaceNoted(std::uint64_t address);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& storage);

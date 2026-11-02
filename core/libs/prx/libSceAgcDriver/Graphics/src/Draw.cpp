@@ -1945,6 +1945,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
+    NoteImageSurfaceUse(ImageSurfaceUse::RenderTarget, color.address, color.bytes);
     try {
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);

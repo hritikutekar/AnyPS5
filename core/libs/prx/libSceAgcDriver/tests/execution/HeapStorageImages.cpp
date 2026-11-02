@@ -47,8 +47,23 @@ std::deque<std::vector<std::uint32_t>> Inputs;
 
 // v1 = tid * 64; v[20:23] data, v[30:33] load address, v[34:37] store address (buffer s[0:3]); image_load
 // v[40:43] from s[4:11] to the output buffer s[12:15]; image_store v[20:23]. Word 6 / 12 carry the MIMG dimension.
-std::array<std::uint32_t, 17> ShaderCode(bool array) {
+std::vector<std::uint32_t> ShaderCode(bool array, bool store = true) {
     const std::uint32_t dim = array ? 5u : 1u;
+    if (!store) {
+        // Load only: the image is sampled-class and read through the driver's sampled textures on the image path.
+        return {
+            0x34020086u,
+            0xe0381000u, 0x80001401u,
+            0xe0381010u, 0x80001e01u,
+            0xe0381020u, 0x80002201u,
+            0xbf8c3f70u,
+            0xf0001f00u | (dim << 3u), 0x0001281eu,
+            0xbf8c3f70u,
+            0xe0781000u, 0x80032801u,
+            0xbf8c3f70u,
+            0xbf810000u,
+        };
+    }
     return {
         0x34020086u,
         0xe0381000u, 0x80001401u,
@@ -207,10 +222,10 @@ struct Result {
     std::array<std::uint32_t, Threads * InputDwords> output{};
 };
 
-void Dispatch(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, bool heap) {
+void Dispatch(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, bool heap, bool store = true) {
     Output.fill(0xdeadbeefu);
     ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(heap);
-    const auto code = ShaderCode(c.slices > 1u);
+    const auto code = ShaderCode(c.slices > 1u, store);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto& copy = Inputs.emplace_back(Input.begin(), Input.end());
     const auto input = BufferDescriptor(copy.data(), static_cast<std::uint32_t>(copy.size() * 4u));
@@ -233,7 +248,7 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& 
     const auto result = ShaderRecompiler::Recompile(request);
     // The texel load and the store are two resources of the same T#: the heap path binds neither image.
     const auto images = std::ranges::count_if(result.bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages; });
-    Require(heap ? images == 0 : images != 0, c.name + (heap ? ": the heap path still binds images" : ": the image path binds no image"));
+    Require(heap && store ? images == 0 : images != 0 || (heap && !store), c.name + (heap ? ": the heap path still binds images" : ": the image path binds no image"));
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(words.data()));
     device.WaitIdle();
     ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(false);
@@ -256,6 +271,88 @@ Result Run(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, 
     run.surface.assign(block, block + bytes + c.pipeBankXor);
     run.output = Output;
     return run;
+}
+
+struct PackedResult {
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint32_t> loads;
+};
+
+// The reflection probe's HDR chain (best642/695: 256x256 fmt 71 SW_4KB_S, 8 mips at 0x502c6b4000): writers store each
+// level through a view of it (base level L), then load-only consumers (sampled textures on the image path) or
+// load-and-store consumers read every level back.
+PackedResult RunChain(AgcDriver::VulkanDevice& device, std::uint8_t* block, std::uint64_t seed, bool writerHeap, bool storeConsumers) {
+    Case chain{"256x256 fmt 71 SW_4KB_S 8 mips", 71u, 0x05u, 0u, 0xfacu, 256u, 256u, 1u, 7u, 0u};
+    const auto bytes = SurfaceBytes(chain, block);
+    FillSurface(block, bytes, seed);
+    for (std::uint32_t level = 0; level < 8u; ++level) {
+        auto c = chain;
+        c.level = level;
+        FillInput(c, seed + level, 0u);
+        Dispatch(device, block, c, writerHeap);
+    }
+    PackedResult result;
+    for (std::uint32_t level = 0; level < 8u; ++level) {
+        auto c = chain;
+        c.level = level;
+        FillInput(c, seed + level, 1u);
+        Dispatch(device, block, c, false, storeConsumers);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) result.loads.insert(result.loads.end(), Output.begin() + tid * InputDwords, Output.begin() + tid * InputDwords + 4u);
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(block), bytes);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), bytes, nullptr, "test");
+    device.WaitIdle();
+    result.bytes.assign(block, block + bytes);
+    return result;
+}
+
+// The reflection probe's packed HDR levels (best483): three single-level fmt 71 SW_4KB_S surfaces whose 4 KiB padded
+// extents overlap, each storing only its element extent: 8x8 at +0x600 (0x200 bytes), 16x16 at +0x800 (0x800), 32x32 at
+// +0x1000 (0x2000). Writers store each surface (the image or the heap path), then consumers through `consumerHeap` load
+// what was stored; the region's bytes and every load are compared.
+
+PackedResult RunPacked(AgcDriver::VulkanDevice& device, std::uint8_t* block, std::uint64_t seed, bool writerHeap, bool consumerHeap) {
+    constexpr std::uint32_t RegionBytes = 0x3000;
+    const std::array<std::pair<std::uint32_t, Case>, 3> surfaces{{
+        {0x1000u, {"32x32 +0x1000", 71u, 0x05u, 0u, 0xfacu, 32u, 32u, 1u, 0u, 0u}},
+        {0x800u, {"16x16 +0x800", 71u, 0x05u, 0u, 0xfacu, 16u, 16u, 1u, 0u, 0u}},
+        {0x600u, {"8x8 +0x600", 71u, 0x05u, 0u, 0xfacu, 8u, 8u, 1u, 0u, 0u}},
+    }};
+    FillSurface(block, RegionBytes, seed);
+    for (const auto& [offset, c] : surfaces) {
+        FillInput(c, seed + offset, 0u);
+        Dispatch(device, block + offset, c, writerHeap);
+    }
+    PackedResult result;
+    for (const auto& [offset, c] : surfaces) {
+        FillInput(c, seed + offset, 1u);
+        Dispatch(device, block + offset, c, consumerHeap);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) result.loads.insert(result.loads.end(), Output.begin() + tid * InputDwords, Output.begin() + tid * InputDwords + 4u);
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(block), RegionBytes);
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), RegionBytes, nullptr, "test");
+    device.WaitIdle();
+    result.bytes.assign(block, block + RegionBytes);
+    return result;
+}
+
+bool ComparePacked(const char* name, const PackedResult& reference, const PackedResult& other) {
+    std::size_t bytes = 0, first = SIZE_MAX, last = 0, loads = 0;
+    for (std::size_t i = 0; i < reference.bytes.size(); ++i) {
+        if (reference.bytes[i] == other.bytes[i]) continue;
+        ++bytes;
+        first = std::min(first, i);
+        last = i;
+    }
+    for (std::size_t i = 0; i < reference.loads.size(); ++i) loads += reference.loads[i] != other.loads[i];
+    if (bytes == 0u && loads == 0u) {
+        std::printf("  ok   packed probe levels: %s\n", name);
+        return true;
+    }
+    std::printf("  FAIL packed probe levels: %s: %zu region bytes differ", name, bytes);
+    if (bytes != 0u) std::printf(" (in +0x%zx..+0x%zx)", first, last);
+    std::printf(", %zu loaded dwords differ (of %zu: 32x32, 16x16, 8x8 consumers in that order)\n", loads, reference.loads.size());
+    return false;
 }
 
 std::string Hex(std::uint32_t value) {
@@ -347,6 +444,33 @@ int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc > 1 && std::string(argv[1]) == "--chain") {
+            GuestBlock imageBlock;
+            GuestBlock heapBlock;
+            bool equal = true;
+            for (std::uint64_t seed = 1; seed <= 3; ++seed) {
+                for (const bool storeConsumers : {false, true}) {
+                    const auto reference = RunChain(*device, imageBlock.Data(), seed, false, storeConsumers);
+                    const auto heap = RunChain(*device, heapBlock.Data(), seed, true, storeConsumers);
+                    equal = ComparePacked(storeConsumers ? "chain: heap writers, image load+store consumers" : "chain: heap writers, image load-only (sampled) consumers", reference, heap) && equal;
+                }
+            }
+            std::printf("heap storage images, probe chain: %s\n", equal ? "equal to the image path" : "DIFFERENT from the image path");
+            return equal ? 0 : 1;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--packed") {
+            GuestBlock imageBlock;
+            GuestBlock heapBlock;
+            bool equal = true;
+            for (std::uint64_t seed = 1; seed <= 3; ++seed) {
+                const auto reference = RunPacked(*device, imageBlock.Data(), seed, false, false);
+                equal = ComparePacked("heap writers, image consumers", reference, RunPacked(*device, heapBlock.Data(), seed, true, false)) && equal;
+                equal = ComparePacked("heap writers, heap consumers", reference, RunPacked(*device, heapBlock.Data(), seed, true, true)) && equal;
+                equal = ComparePacked("image writers, heap consumers", reference, RunPacked(*device, heapBlock.Data(), seed, false, true)) && equal;
+            }
+            std::printf("heap storage images, packed probe levels: %s\n", equal ? "equal to the image path" : "DIFFERENT from the image path");
+            return equal ? 0 : 1;
+        }
         const bool mixed = argc > 1 && std::string(argv[1]) == "--mixed";
         const std::string only = argc > (mixed ? 2 : 1) ? argv[mixed ? 2 : 1] : "";
         GuestBlock imageBlock;

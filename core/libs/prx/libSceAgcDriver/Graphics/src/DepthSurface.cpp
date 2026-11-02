@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <array>
 #include <atomic>
@@ -2934,9 +2935,105 @@ bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t 
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });
 }
 
+namespace {
+
+// Merged guest ranges of image-held surfaces (NoteImageSurfaceUse), and the bases already noted.
+struct ImageSurfaceUses {
+    std::shared_mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> bases;
+    std::unordered_map<std::uint64_t, ImageSurfaceUse> kinds;
+    std::map<std::uint64_t, std::uint64_t> ranges;
+    std::array<std::atomic<std::uint64_t>, 3> noted{};
+};
+
+ImageSurfaceUses& imageSurfaceUses() {
+    static ImageSurfaceUses uses;
+    return uses;
+}
+
+bool heapStorageOnly() {
+    static const bool enabled = std::getenv("APS5_NO_HEAP_STORAGE") == nullptr && std::getenv("APS5_NO_HEAP_STORAGE_ONLY") == nullptr;
+    return enabled;
+}
+
+bool heapTrace() {
+    static const bool enabled = std::getenv("APS5_HEAP_SURFACE_TRACE") != nullptr;
+    return enabled;
+}
+
+// The kind of the first image-held range over [begin, end), as a name; null when none.
+const char* imageSurfaceUseOver(std::uint64_t begin, std::uint64_t end) {
+    auto& uses = imageSurfaceUses();
+    std::shared_lock lock(uses.mutex);
+    auto found = uses.ranges.upper_bound(begin);
+    if (found != uses.ranges.begin() && std::prev(found)->second > begin) return "an image-held surface";
+    if (found != uses.ranges.end() && found->first < end) return "an image-held surface";
+    return nullptr;
+}
+
+}
+
+bool ImageSurfaceNoted(std::uint64_t address) {
+    if (!heapStorageOnly()) return true;
+    auto& uses = imageSurfaceUses();
+    std::shared_lock lock(uses.mutex);
+    return uses.bases.contains(address);
+}
+
+void NoteImageSurfaceUse(ImageSurfaceUse use, std::uint64_t address, std::uint64_t bytes) {
+    if (!heapStorageOnly() || address == 0 || bytes == 0) return;
+    auto& uses = imageSurfaceUses();
+    const auto end = address + bytes;
+    {
+        std::shared_lock lock(uses.mutex);
+        if (const auto found = uses.bases.find(address); found != uses.bases.end() && found->second >= end) return;
+    }
+    std::unique_lock lock(uses.mutex);
+    auto& known = uses.bases[address];
+    if (known >= end) return;
+    known = end;
+    uses.kinds.emplace(address, use);
+    uses.noted[static_cast<std::size_t>(use)].fetch_add(1, std::memory_order_relaxed);
+    auto begin = address;
+    auto last = end;
+    auto at = uses.ranges.upper_bound(begin);
+    if (at != uses.ranges.begin() && std::prev(at)->second >= begin) at = std::prev(at);
+    while (at != uses.ranges.end() && at->first <= last) {
+        begin = std::min(begin, at->first);
+        last = std::max(last, at->second);
+        at = uses.ranges.erase(at);
+    }
+    uses.ranges.emplace(begin, last);
+    if (heapTrace()) {
+        static const char* names[] = {"render target", "sampled texture", "image-path storage image"};
+        std::fprintf(stderr, "[heap-storage] noted %s 0x%llx+0x%llx (image-held ranges: %zu)\n", names[static_cast<std::size_t>(use)], static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), uses.ranges.size());
+    }
+}
+
 bool HeapRangeServedInPlace(std::uint64_t begin, std::uint64_t end) {
     const auto allocation = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(begin), false);
     if (allocation == nullptr || end > allocation->address + allocation->bytes) return false;
+    if (heapStorageOnly() && imageSurfaceUseOver(begin, end) != nullptr) {
+        if (heapTrace()) {
+            static std::mutex mutex;
+            static std::unordered_set<std::uint64_t> traced;
+            std::lock_guard traceLock(mutex);
+            if (traced.insert(begin).second) {
+                static const char* names[] = {"render target", "sampled texture", "image-path storage image"};
+                auto& uses = imageSurfaceUses();
+                std::shared_lock lock(uses.mutex);
+                std::string over;
+                for (const auto& [base, last] : uses.bases) {
+                    if (base >= end || last <= begin || over.size() > 300) continue;
+                    char item[96];
+                    std::snprintf(item, sizeof(item), " %s 0x%llx+0x%llx;", names[static_cast<std::size_t>(uses.kinds.at(base))], static_cast<unsigned long long>(base), static_cast<unsigned long long>(last - base));
+                    over += item;
+                }
+                std::fprintf(stderr, "[heap-storage] refused 0x%llx+0x%llx: image-held surfaces over it:%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), over.c_str());
+            }
+        }
+        return false;
+    }
     std::lock_guard lock(surfacesMutex());
     if (!mayOverlap(begin, end - begin)) return true;
     return std::none_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->Overlaps(begin, end - begin); });
