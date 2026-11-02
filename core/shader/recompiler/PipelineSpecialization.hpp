@@ -25,6 +25,31 @@ inline constexpr std::uint32_t DeferredDirectImageMode = 0xfffffff0u;
 inline constexpr bool IsDeferredDirectImageMode(std::uint32_t value) {
     return value == DeferredDirectImageMode;
 }
+// Heap storage images (ShaderInfo::heapImages): a selector word of HeapImageMode(format) reads and writes the storage
+// image as guest memory through the BDA page table, at the PS5 tiled address of its T# and in the given element
+// format (an IrBufferFormat). HeapImageBase + resource * HeapImageWords holds the tiling of the selected surface:
+// word 0 log2 block bytes, 1 log2 block width, 2 log2 block height (elements), 3 the mask of the T# base address
+// bits that are the pipe/bank XOR (0 for the modes without one), 4..19 the 16 in-block address-bit equations
+// (TextureSwizzleEquations.hpp's encoding: bits 0-11 select x, 12-23 y, 24-31 slice bits), 20 the byte offset of the
+// T#'s base level in its mip chain, 21 that level's blocks per row, 22 its mip-tail placement (bit 31 set: the level
+// lies in the tail block at element x bits 0-15, y bits 16-30), 23 the bytes of one array slice's mip chain.
+inline constexpr std::uint32_t HeapImageModeBase = 0xfffff000u;
+inline constexpr std::uint32_t HeapImageMode(std::uint32_t format) {
+    return HeapImageModeBase + format;
+}
+inline constexpr bool IsHeapImageMode(std::uint32_t value) {
+    return value >= HeapImageModeBase && value < HeapImageModeBase + 0x100u;
+}
+inline constexpr std::uint32_t HeapImageFormat(std::uint32_t value) {
+    return value - HeapImageModeBase;
+}
+inline constexpr std::uint32_t HeapImageBase = 32768u;
+inline constexpr std::uint32_t HeapImageWords = 24u;
+inline constexpr std::uint32_t HeapImageEquationWord = 4u;
+inline constexpr std::uint32_t HeapImageLevelOffsetWord = 20u;
+inline constexpr std::uint32_t HeapImageBlocksPerRowWord = 21u;
+inline constexpr std::uint32_t HeapImageTailWord = 22u;
+inline constexpr std::uint32_t HeapImageSliceBytesWord = 23u;
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;

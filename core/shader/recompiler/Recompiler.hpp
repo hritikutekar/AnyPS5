@@ -330,6 +330,10 @@ struct SpirvTarget {
     // exact under SignedZeroInfNanPreserve 32, which the device requires (an AMD host: the driver sets it,
     // APS5_NO_NATIVE_ISNAN=1 clears it).
     bool nativeF32IsNan = false;
+    // Storage images that only load and store texels get heap cases: with the HeapImageMode selector the driver binds
+    // no image and the shader reads and writes the T#'s tiled guest bytes through the BDA page table
+    // (PipelineSpecialization::HeapImageMode; the driver sets it, APS5_NO_HEAP_STORAGE=1 clears it).
+    bool heapStorageImages = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;

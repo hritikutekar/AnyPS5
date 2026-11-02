@@ -2338,6 +2338,7 @@ target_include_directories(agc_driver_capture_bind_publication_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 target_include_directories(agc_driver_image_table_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(agc_driver_heap_storage_images_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_direct_image_refusal_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>

@@ -93,8 +93,8 @@ static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: upda
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 352, "CompiledShaderInfo changed: update the info encoder");
-static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 360, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(ShaderInfo) == 240, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 92, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 24, "SamplerResource changed: update the info encoder");
@@ -106,7 +106,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 736, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 128, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -140,7 +140,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 42, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -832,6 +832,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
     writer.Value(info.layerExported);
+    writer.Value(info.heapImages);
 }
 
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
@@ -940,6 +941,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
     reader.Value(info.layerExported);
+    reader.Value(info.heapImages);
 }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {

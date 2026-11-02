@@ -2750,6 +2750,144 @@ void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageR
     }
 }
 
+// The heap case of a storage image texel load or store (PipelineSpecialization::HeapImageMode): the texel's guest
+// address from its T# (base, extent, pipe/bank XOR) and the HeapImageBase tiling words, the element in `format`
+// packed or unpacked here, and the access through the BDA page table (no image is bound).
+void EmitHeapImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image, IrBufferFormat format) {
+    auto& state = ctx.state;
+    const auto& mem = ctx.Memory(inst);
+    const bool write = inst.Opcode() == IrOpcode::ImageWrite;
+    if (!write && inst.Opcode() != IrOpcode::ImageRead) ctx.Fail(inst, "has no heap storage image path");
+    const auto* address = ctx.ImageAddress(inst.Argument(1));
+    if (address == nullptr) ctx.Fail(inst, "has no image address");
+    const auto* handle = inst.Argument(0)->Resolve();
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetImageResource || handle->ArgumentCount() != 8u) ctx.Fail(inst, "has no heap storage image descriptor");
+    auto heapImage = image;
+    heapImage.conversionFormat = IrBufferFormat::Invalid;
+    heapImage.packedFormat = IrBufferFormat::Invalid;
+    heapImage.srgbDecode = false;
+    const ImageEmitAccess access{inst, mem, heapImage, *address};
+    const auto info = GetFormatInfo(format);
+    const auto dwords = info.byteSize / 4u;
+    if (info.componentCount == 0u || (info.byteSize != 4u && info.byteSize != 8u && info.byteSize != 16u)) ctx.Fail(inst, "has a heap storage format that is not whole dwords");
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };
+    const auto op64 = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u64, lhs, rhs); };
+    const auto widen = [&](std::uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); };
+    const auto spec = [&](std::uint32_t word) { return state.module.SpecializationConstant(u32, PipelineSpecialization::HeapImageBase + mem.resource * PipelineSpecialization::HeapImageWords + word, 0u); };
+    const auto word0 = ctx.Def(handle->Argument(0));
+    const auto word1 = ctx.Def(handle->Argument(1));
+    const auto word2 = ctx.Def(handle->Argument(2));
+    const bool array = image.dimension == RdnaImageDimension::Dim2DArray;
+    const auto x = AddressU32(ctx, access, 0u);
+    const auto y = AddressU32(ctx, access, 1u);
+    const auto slice = array ? AddressU32(ctx, access, 2u) : constant(0u);
+    // T# extent (DecodeTextureResource): width-1 in word1[31:30] and word2[11:0], height-1 in word2[27:14], the base
+    // level (the one addressed) in word3[15:12], the last array slice in word4[12:0].
+    const auto level = op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, ctx.Def(handle->Argument(3)), constant(12u)), constant(0xfu));
+    const auto levelExtent = [&](std::uint32_t extent) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, u32, result, GlslStd450(state), GLSLstd450UMax, op(spv::OpShiftRightLogical, extent, level), constant(1u));
+        return result;
+    };
+    const auto width = levelExtent(op(spv::OpIAdd, op(spv::OpBitwiseOr, op(spv::OpShiftRightLogical, word1, constant(30u)), op(spv::OpShiftLeftLogical, op(spv::OpBitwiseAnd, word2, constant(0xfffu)), constant(2u))), constant(1u)));
+    const auto height = levelExtent(op(spv::OpIAdd, op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, word2, constant(14u)), constant(0x3fffu)), constant(1u)));
+    auto inside = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpULessThan, boolean, x, width), Binary(state, spv::OpULessThan, boolean, y, height));
+    if (array) inside = Binary(state, spv::OpLogicalAnd, boolean, inside, Binary(state, spv::OpULessThanEqual, boolean, slice, op(spv::OpBitwiseAnd, ctx.Def(handle->Argument(4)), constant(0x1fffu))));
+    const auto guestAddress = [&] {
+        const auto log2Block = spec(0u);
+        const auto log2Width = spec(1u);
+        const auto log2Height = spec(2u);
+        const auto descriptorBase = op64(spv::OpShiftLeftLogical, op64(spv::OpBitwiseOr, op64(spv::OpShiftLeftLogical, widen(op(spv::OpBitwiseAnd, word1, constant(0xffu))), BdaConstant(state, 32u)), widen(word0)), BdaConstant(state, 8u));
+        const auto pipeBankXor = op(spv::OpBitwiseAnd, Unary(state, spv::OpUConvert, u32, descriptorBase), spec(3u));
+        const auto base = op64(spv::OpISub, descriptorBase, widen(pipeBankXor));
+        // A level in the mip tail is addressed inside the chain's first block at its tail placement.
+        const auto tail = spec(PipelineSpecialization::HeapImageTailWord);
+        const auto inTail = Binary(state, spv::OpINotEqual, boolean, op(spv::OpShiftRightLogical, tail, constant(31u)), constant(0u));
+        const auto blockIndex = Select(state, u32, inTail, constant(0u), op(spv::OpIAdd, op(spv::OpIMul, op(spv::OpShiftRightLogical, y, log2Height), spec(PipelineSpecialization::HeapImageBlocksPerRowWord)), op(spv::OpShiftRightLogical, x, log2Width)));
+        const auto swizzleX = op(spv::OpIAdd, x, op(spv::OpBitwiseAnd, tail, constant(0xffffu)));
+        const auto swizzleY = op(spv::OpIAdd, y, op(spv::OpBitwiseAnd, op(spv::OpShiftRightLogical, tail, constant(16u)), constant(0x7fffu)));
+        const auto shiftedY = op(spv::OpShiftLeftLogical, swizzleY, constant(12u));
+        const auto shiftedSlice = op(spv::OpShiftLeftLogical, slice, constant(24u));
+        auto inBlock = pipeBankXor;
+        for (std::uint32_t bit = 0; bit < 16u; ++bit) {
+            const auto mask = spec(PipelineSpecialization::HeapImageEquationWord + bit);
+            auto selected = op(spv::OpBitwiseXor, op(spv::OpBitwiseAnd, swizzleX, op(spv::OpBitwiseAnd, mask, constant(0xfffu))), op(spv::OpBitwiseAnd, shiftedY, op(spv::OpBitwiseAnd, mask, constant(0xfff000u))));
+            if (array) selected = op(spv::OpBitwiseXor, selected, op(spv::OpBitwiseAnd, shiftedSlice, op(spv::OpBitwiseAnd, mask, constant(0xff000000u))));
+            const auto parity = op(spv::OpBitwiseAnd, Unary(state, spv::OpBitCount, u32, selected), constant(1u));
+            inBlock = op(spv::OpBitwiseXor, inBlock, op(spv::OpShiftLeftLogical, parity, constant(bit)));
+        }
+        auto offset = op64(spv::OpIAdd, widen(spec(PipelineSpecialization::HeapImageLevelOffsetWord)), op64(spv::OpIAdd, op64(spv::OpShiftLeftLogical, widen(blockIndex), widen(log2Block)), widen(inBlock)));
+        if (array) offset = op64(spv::OpIAdd, offset, op64(spv::OpIMul, widen(slice), widen(spec(PipelineSpecialization::HeapImageSliceBytesWord))));
+        return op64(spv::OpIAdd, base, offset);
+    };
+    if (write) {
+        const auto condition = Binary(state, spv::OpLogicalAnd, boolean, ctx.Arg(inst, 3), inside);
+        EmitIfCondition(state, condition, [&] {
+            const auto texel = StoreTexel(ctx, access, ctx.Arg(inst, 2), true);
+            std::array<std::uint32_t, 4> words{constant(0u), constant(0u), constant(0u), constant(0u)};
+            for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+                const auto raw = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, u32, raw, texel, component);
+                const auto bits = EmitFormatStoreComponent(state, info, component, raw);
+                const auto offset = info.componentBitOffset[component];
+                if (offset % 32u + info.componentBits[component] > 32u) ctx.Fail(inst, "has a heap storage component across dwords");
+                words[offset / 32u] = op(spv::OpBitwiseOr, words[offset / 32u], offset % 32u == 0u ? bits : op(spv::OpShiftLeftLogical, bits, constant(offset % 32u)));
+            }
+            const auto guest = guestAddress();
+            if (dwords == 1u) {
+                EmitBdaStore(ctx, inst, guest, words[0], 32u);
+                return;
+            }
+            const auto vector = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector, words[0], words[1], words[2], words[3]);
+            EmitBdaDwordWrites(ctx, inst, guest, 0u, dwords, vector, true);
+        });
+        return;
+    }
+    const auto condition = Binary(state, spv::OpLogicalAnd, boolean, ctx.Arg(inst, 2), inside);
+    // Out of the level the element reads as zero bits, and goes through the unpack like a loaded one: a format without
+    // alpha still reads alpha 1 (as the image path's out-of-bounds texel).
+    const auto element = EmitValueOrDefaultIfCondition(state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
+        const auto read = EmitBdaDwordReads(ctx, inst, guestAddress(), 0u, dwords, true);
+        const auto vector = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), vector, read[0], dwords > 1u ? read[1] : constant(0u), dwords > 2u ? read[2] : constant(0u), dwords > 3u ? read[3] : constant(0u));
+        return vector;
+    });
+    ctx.Define(inst, [&]() {
+        std::array<std::uint32_t, 4> loaded{};
+        for (std::uint32_t dword = 0; dword < 4u; ++dword) {
+            loaded[dword] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, loaded[dword], element, dword);
+        }
+        const auto one = constant(FormattedConstantBits(info, SpirvFormattedSourceKind::One));
+        std::array<std::uint32_t, 4> components{constant(0u), constant(0u), constant(0u), one};
+        for (std::uint32_t component = 0; component < info.componentCount; ++component) {
+            const auto bits = info.componentBits[component];
+            const auto offset = info.componentBitOffset[component];
+            auto raw = loaded[offset / 32u];
+            if (bits < 32u) {
+                // Signed components are sign-extended, as the conversion of a signed field expects.
+                const bool signedComponent = info.type == SpirvFormatComponentType::Snorm || info.type == SpirvFormatComponentType::Sint || info.type == SpirvFormatComponentType::Sscaled;
+                raw = state.module.AllocateId();
+                state.module.AddFunction(signedComponent ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, u32, raw, loaded[offset / 32u], constant(offset % 32u), constant(bits));
+            }
+            components[component] = NormalizeFormatComponent(state, info, component, raw);
+        }
+        std::uint32_t selected[4] = {};
+        for (std::uint32_t component = 0; component < 4u; component++) {
+            const auto selector = RuntimeImageSwizzle(state, mem.resource, component);
+            selected[component] = Select(state, u32, Binary(state, spv::OpIEqual, boolean, selector, constant(1u)), one, RuntimeSwizzledComponent(state, selector, components));
+        }
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, selected[0], selected[1], selected[2], selected[3]);
+        return result;
+    }());
+}
+
 void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
@@ -2797,7 +2935,10 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             EmitImageMode(ctx, inst, mode);
         }
     };
-    if (modes.size() == 1u && !tables && !directRefusal) {
+    // Heap storage images also take the heap cases (one per element format) of the same selector.
+    const bool heap = !tables && !state.registrationModules && memory.resource < 64u && ((state.program.Info().heapImages >> memory.resource) & 1u) != 0u;
+    const auto heapFormats = heap ? ResourceMaterializer::HeapStorageFormats() : std::span<const IrBufferFormat>{};
+    if (modes.size() == 1u && !tables && !directRefusal && !heap) {
         emitMode(modes.front());
         state.runtimeImage = nullptr;
         return;
@@ -2833,12 +2974,25 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         incoming.insert(incoming.end(), {undefined, state.currentLabel});
     }
     if (directRefusal) words.insert(words.end(), {state.registrationModules ? RuntimeAbi::ImageModeMask : PipelineSpecialization::DeferredDirectImageMode, refused});
+    std::vector<std::uint32_t> heapLabels(heapFormats.size());
+    for (std::size_t index = 0u; index < heapFormats.size(); ++index) {
+        heapLabels[index] = state.module.AllocateId();
+        words.insert(words.end(), {PipelineSpecialization::HeapImageMode(static_cast<std::uint32_t>(heapFormats[index])), heapLabels[index]});
+    }
     state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
     state.module.AddFunction(words);
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         if (labels[index] == 0u) continue;
         EmitLabel(state, labels[index]);
         emitMode(modes[index]);
+        if (returnsValue) incoming.insert(incoming.end(), {ctx.Def(&inst), state.currentLabel});
+        ctx.definitions.erase(&inst);
+        state.module.AddFunction(spv::OpBranch, merge);
+    }
+    for (std::size_t index = 0u; index < heapFormats.size(); ++index) {
+        EmitLabel(state, heapLabels[index]);
+        state.runtimeImage = &base;
+        EmitHeapImageMode(ctx, inst, base, heapFormats[index]);
         if (returnsValue) incoming.insert(incoming.end(), {ctx.Def(&inst), state.currentLabel});
         ctx.definitions.erase(&inst);
         state.module.AddFunction(spv::OpBranch, merge);

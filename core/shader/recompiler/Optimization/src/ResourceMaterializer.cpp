@@ -11,6 +11,7 @@
 #include "UnnormalizedWrap.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2622,6 +2623,213 @@ void ResourceMaterializer::PrepareDirectImageRefusals(IrProgram& program, bool f
             return;
         }
     }
+}
+
+namespace {
+
+bool heapStorageMemory(const MemoryInfo& memory, const ImageResource& image) {
+    return memory.kind == ResourceKind::Image && memory.dataBits == 32u && !memory.d16 && memory.imageSampleFlags == 0u
+        && !memory.imageHasMip && !memory.imagePacked && !memory.imageR128 && memory.imageByElements == 0u
+        && !memory.gpuDescriptor && memory.imageDimension == image.dimension;
+}
+
+constexpr std::array<IrBufferFormat, 18> heapStorageFormats{
+    IrBufferFormat::Format32UInt, IrBufferFormat::Format32SInt, IrBufferFormat::Format32Float,
+    IrBufferFormat::Format16_16UNorm, IrBufferFormat::Format16_16UInt, IrBufferFormat::Format16_16Float,
+    IrBufferFormat::Format11_11_10Float, IrBufferFormat::Format10_10_10_2UNorm, IrBufferFormat::Format8_8_8_8UNorm, IrBufferFormat::Format8_8_8_8SNorm,
+    IrBufferFormat::Format8_8_8_8UInt, IrBufferFormat::Format32_32UInt, IrBufferFormat::Format32_32Float,
+    IrBufferFormat::Format16_16_16_16UNorm, IrBufferFormat::Format16_16_16_16UInt, IrBufferFormat::Format16_16_16_16Float,
+    IrBufferFormat::Format32_32_32_32UInt, IrBufferFormat::Format32_32_32_32Float,
+};
+
+std::atomic<int> heapStorageSelection{-1};
+
+// The detiler's standard (SW_*_S) swizzle (TextureDetile.comp standardOffset / standard64Extra).
+std::uint32_t standardSwizzleOffset(std::uint32_t elementBytes, bool block64, std::uint32_t x, std::uint32_t y) {
+    std::uint32_t offset = 0;
+    switch (elementBytes) {
+        case 1u: offset = ((y << 4) & 0x1f0u) ^ ((y << 5) & 0x400u) ^ (x & 0x00fu) ^ ((x << 5) & 0x200u) ^ ((x << 6) & 0x800u); break;
+        case 2u: offset = ((y << 4) & 0x070u) ^ ((y << 5) & 0x100u) ^ ((y << 6) & 0x400u) ^ ((x << 1) & 0x00eu) ^ ((x << 4) & 0x080u) ^ ((x << 5) & 0x200u) ^ ((x << 6) & 0x800u); break;
+        case 4u: offset = ((y << 4) & 0x070u) ^ ((y << 5) & 0x100u) ^ ((y << 6) & 0x400u) ^ ((x << 2) & 0x00cu) ^ ((x << 5) & 0x080u) ^ ((x << 6) & 0x200u) ^ ((x << 7) & 0x800u); break;
+        case 8u: offset = ((y << 4) & 0x030u) ^ ((y << 6) & 0x100u) ^ ((y << 7) & 0x400u) ^ ((x << 3) & 0x008u) ^ ((x << 5) & 0x0c0u) ^ ((x << 6) & 0x200u) ^ ((x << 7) & 0x800u); break;
+        default: offset = ((y << 4) & 0x030u) ^ ((y << 6) & 0x100u) ^ ((y << 7) & 0x400u) ^ ((x << 6) & 0x0c0u) ^ ((x << 7) & 0x200u) ^ ((x << 8) & 0x800u); break;
+    }
+    if (!block64) return offset & 0xfffu;
+    switch (elementBytes) {
+        case 1u: offset ^= ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^ ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u); break;
+        case 2u: offset ^= ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^ ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u); break;
+        case 4u: offset ^= ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^ ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u); break;
+        case 8u: offset ^= ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^ ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u); break;
+        default: offset ^= ((x << 9) & 0x2000u) ^ ((x << 10) & 0x8000u) ^ ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u); break;
+    }
+    return offset & 0xffffu;
+}
+
+}
+
+bool ResourceMaterializer::HeapStorageCandidate(const IrProgram& program, std::uint32_t index) {
+    const auto& resources = program.Resources();
+    if (resources.stage != IrShaderStage::Compute || index >= 64u) return false;
+    const auto& image = resources.info.images.at(index);
+    if (image.table != NoTable || image.resourceClass == ImageResourceClass::None || image.atomic || image.depthBits || image.r128
+        || image.mipMode == ImageMipMode::DynamicStorage || (image.dimension != RdnaImageDimension::Dim2D && image.dimension != RdnaImageDimension::Dim2DArray)
+        || std::any_of(resources.info.sampledPairs.begin(), resources.info.sampledPairs.end(), [&](const auto& pair) { return pair.image == index; })) return false;
+    bool found = false;
+    for (const auto& block : program.Blocks()) {
+        for (const auto* instruction : block->Instructions()) {
+            if (ImageOpcodeInfoOf(instruction->Opcode()).resourceClass == ImageResourceClass::None) continue;
+            const auto& memory = resources.memoryInfo.at(instruction->Flags<MemoryFlags>().index);
+            if (memory.resource != index) continue;
+            if ((instruction->Opcode() != IrOpcode::ImageRead && instruction->Opcode() != IrOpcode::ImageWrite) || !heapStorageMemory(memory, image)) return false;
+            const auto* handle = instruction->Argument(0) != nullptr ? instruction->Argument(0)->Resolve() : nullptr;
+            if (handle == nullptr || handle->Opcode() != IrOpcode::GetImageResource || handle->ArgumentCount() != 8u) return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
+void ResourceMaterializer::PrepareHeapStorageImages(IrProgram& program) {
+    auto& info = program.Info();
+    std::uint64_t heap = 0;
+    bool written = false;
+    for (std::uint32_t index = 0u; index < info.images.size(); ++index) {
+        if (!HeapStorageCandidate(program, index)) continue;
+        heap |= std::uint64_t{1} << index;
+        written = written || info.images[index].written;
+    }
+    info.heapImages = heap;
+    if (heap == 0u) return;
+    info.usesDma = true;
+    info.usesFaultBuffer = true;
+    info.bdaWrites = info.bdaWrites || written;
+}
+
+std::span<const IrBufferFormat> ResourceMaterializer::HeapStorageFormats() {
+    return heapStorageFormats;
+}
+
+bool ResourceMaterializer::HeapStorageSelected() {
+    auto selected = heapStorageSelection.load(std::memory_order_relaxed);
+    if (selected < 0) {
+        const char* text = std::getenv("APS5_HEAP_STORAGE");
+        selected = text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 ? 1 : 0;
+        heapStorageSelection.store(selected, std::memory_order_relaxed);
+    }
+    return selected != 0;
+}
+
+void ResourceMaterializer::SetHeapStorageSelection(bool selected) {
+    heapStorageSelection.store(selected ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::optional<HeapImageSelection> ResourceMaterializer::HeapImageSelectionFor(const ShaderInfo& info, std::uint32_t index, const DescriptorValue& descriptor) {
+    if (index >= 64u || ((info.heapImages >> index) & 1u) == 0u || !HeapStorageSelected() || descriptor.dwordCount != 8u) return std::nullopt;
+    static const bool trace = std::getenv("APS5_HEAP_TRACE") != nullptr;
+    const auto& w = descriptor.dwords;
+    const auto refuse = [&](const char* reason) -> std::optional<HeapImageSelection> {
+        if (trace) std::fprintf(stderr, "[heap-storage] image %u T# %08x %08x %08x %08x %08x %08x %08x %08x stays an image: %s\n", index, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], reason);
+        return std::nullopt;
+    };
+    const auto format = static_cast<IrBufferFormat>((w[1] >> 20u) & 0x1ffu);
+    if (std::ranges::find(heapStorageFormats, format) == heapStorageFormats.end()) return refuse("format");
+    const auto elementBytes = GetFormatInfo(format).byteSize;
+    const auto type = (w[3] >> 28u) & 0xfu;
+    const auto dimension = info.images.at(index).dimension;
+    const auto tile = (w[3] >> 20u) & 0x1fu;
+    const auto width = (((w[1] >> 30u) & 0x3u) | ((w[2] & 0xfffu) << 2u)) + 1u;
+    const auto height = ((w[2] >> 14u) & 0x3fffu) + 1u;
+    const auto baseLevel = (w[3] >> 12u) & 0xfu;
+    const auto mipCount = ((w[5] >> 4u) & 0xfu) + 1u;
+    const auto baseArray = (w[4] >> 16u) & 0x1fffu;
+    if ((w[0] | (w[1] & 0xffu)) == 0u) return refuse("null base");
+    if (dimension == RdnaImageDimension::Dim2D ? type != 9u : type != 13u) return refuse("dimension");
+    if (baseLevel >= mipCount || baseArray != 0u) return refuse("base level past the chain or base array");
+    if (((w[6] >> 21u) & 1u) != 0u) return refuse("metadata compression");
+    if (elementBytes != 4u && elementBytes != 8u && elementBytes != 16u) return refuse("element size");
+    const bool standard = tile == 0x05u || tile == 0x09u;
+    if (!standard && (tile < 0x18u || tile > 0x1bu)) return refuse("tile mode");
+    const bool block64 = tile != 0x05u;
+    // Thin block extents (log2 elements) and mip-tail placements for 1, 2, 4, 8 and 16 bytes per element
+    // (TextureTiling.cpp GetBlockLayout / GetMipTailLayout, addrlib Block4K / Block64K).
+    constexpr std::array<std::array<std::uint32_t, 2>, 5> thin4KB{{{6u, 6u}, {6u, 5u}, {5u, 5u}, {5u, 4u}, {4u, 4u}}};
+    constexpr std::array<std::array<std::uint32_t, 2>, 5> thin64KB{{{8u, 8u}, {8u, 7u}, {7u, 7u}, {7u, 6u}, {6u, 6u}}};
+    constexpr std::uint32_t tail4KB[5][8][2] = {
+        {{32, 0}, {16, 32}, {0, 48}, {0, 32}, {16, 16}, {16, 0}, {0, 16}, {0, 0}},
+        {{32, 0}, {16, 16}, {0, 24}, {0, 16}, {16, 8}, {16, 0}, {0, 8}, {0, 0}},
+        {{16, 0}, {8, 16}, {0, 24}, {0, 16}, {8, 8}, {8, 0}, {0, 8}, {0, 0}},
+        {{16, 0}, {8, 8}, {0, 12}, {0, 8}, {8, 4}, {8, 0}, {0, 4}, {0, 0}},
+        {{8, 0}, {4, 8}, {0, 12}, {0, 8}, {4, 4}, {4, 0}, {0, 4}, {0, 0}},
+    };
+    constexpr std::uint32_t tail64KB[5][12][2] = {
+        {{128, 0}, {0, 128}, {64, 0}, {0, 64}, {32, 0}, {16, 32}, {0, 48}, {0, 32}, {16, 16}, {16, 0}, {0, 16}, {0, 0}},
+        {{128, 0}, {0, 64}, {64, 0}, {0, 32}, {32, 0}, {16, 16}, {0, 24}, {0, 16}, {16, 8}, {16, 0}, {0, 8}, {0, 0}},
+        {{64, 0}, {0, 64}, {32, 0}, {0, 32}, {16, 0}, {8, 16}, {0, 24}, {0, 16}, {8, 8}, {8, 0}, {0, 8}, {0, 0}},
+        {{64, 0}, {0, 32}, {32, 0}, {0, 16}, {16, 0}, {8, 8}, {0, 12}, {0, 8}, {8, 4}, {8, 0}, {0, 4}, {0, 0}},
+        {{32, 0}, {0, 32}, {16, 0}, {0, 16}, {8, 0}, {4, 8}, {0, 12}, {0, 8}, {4, 4}, {4, 0}, {0, 4}, {0, 0}},
+    };
+    const auto log2Element = static_cast<std::uint32_t>(std::countr_zero(elementBytes));
+    const auto log2Width = (block64 ? thin64KB : thin4KB)[log2Element][0];
+    const auto log2Height = (block64 ? thin64KB : thin4KB)[log2Element][1];
+    const auto log2Block = block64 ? 16u : 12u;
+    HeapImageSelection selection;
+    selection.mode = PipelineSpecialization::HeapImageMode(static_cast<std::uint32_t>(format));
+    auto& words = selection.words;
+    words[0] = log2Block;
+    words[1] = log2Width;
+    words[2] = log2Height;
+    words[3] = standard ? 0u : (1u << log2Block) - 1u;
+    if (standard) {
+        for (std::uint32_t bit = 0; bit < 12u; ++bit) {
+            const auto fromX = standardSwizzleOffset(elementBytes, block64, 1u << bit, 0u);
+            const auto fromY = standardSwizzleOffset(elementBytes, block64, 0u, 1u << bit);
+            for (std::uint32_t address = 0; address < 16u; ++address) {
+                if (((fromX >> address) & 1u) != 0u) words[PipelineSpecialization::HeapImageEquationWord + address] |= 1u << bit;
+                if (((fromY >> address) & 1u) != 0u) words[PipelineSpecialization::HeapImageEquationWord + address] |= 1u << (12u + bit);
+            }
+        }
+    } else {
+        const auto* equation = AgcDriver::Graphics::FindTextureSwizzleEquation(tile, elementBytes);
+        if (equation == nullptr) return refuse("no swizzle equation");
+        std::copy(equation->bits.begin(), equation->bits.end(), words.begin() + PipelineSpecialization::HeapImageEquationWord);
+    }
+    // The mip chain of one slice (TextureTiling.cpp ComputeTiledMipLayout): the tail block (if any) first, then the
+    // levels above it from the smallest to level 0.
+    const auto shiftCeil = [](std::uint32_t value, std::uint32_t shift) { return static_cast<std::uint32_t>((static_cast<std::uint64_t>(value) + (1ull << shift) - 1ull) >> shift); };
+    const auto alignUp = [](std::uint32_t value, std::uint32_t alignment) { return (value + alignment - 1u) / alignment * alignment; };
+    const auto blockWidth = 1u << log2Width;
+    const auto blockHeight = 1u << log2Height;
+    const auto tailLevels = block64 ? 12u : 8u;
+    auto firstTail = mipCount;
+    if (mipCount > 1u) {
+        for (std::uint32_t level = 0; level < mipCount; ++level) {
+            if (shiftCeil(width, level) <= (blockWidth >> 1u) && shiftCeil(height, level) <= blockHeight && mipCount - level <= tailLevels) {
+                firstTail = level;
+                break;
+            }
+        }
+    }
+    std::uint64_t cursor = firstTail < mipCount ? (1ull << log2Block) : 0ull;
+    std::uint64_t levelOffset = 0;
+    std::uint32_t blocksPerRow = 1u;
+    for (auto level = firstTail; level-- > 0u;) {
+        const auto paddedWidth = alignUp(std::max(shiftCeil(width, level), 1u), blockWidth);
+        const auto paddedHeight = alignUp(std::max(shiftCeil(height, level), 1u), blockHeight);
+        if (level == baseLevel) {
+            levelOffset = cursor;
+            blocksPerRow = paddedWidth / blockWidth;
+        }
+        cursor += static_cast<std::uint64_t>(paddedWidth) * paddedHeight * elementBytes;
+    }
+    if (cursor > 0xffffffffull) return refuse("mip chain past 4 GiB");
+    if (baseLevel >= firstTail) {
+        const auto& at = (block64 ? tail64KB[log2Element][baseLevel - firstTail] : tail4KB[log2Element][baseLevel - firstTail]);
+        words[PipelineSpecialization::HeapImageTailWord] = 0x80000000u | (at[1] << 16u) | at[0];
+    }
+    words[PipelineSpecialization::HeapImageLevelOffsetWord] = static_cast<std::uint32_t>(levelOffset);
+    words[PipelineSpecialization::HeapImageBlocksPerRowWord] = blocksPerRow;
+    words[PipelineSpecialization::HeapImageSliceBytesWord] = static_cast<std::uint32_t>(cursor);
+    return selection;
 }
 
 void ResourceMaterializer::ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal) {

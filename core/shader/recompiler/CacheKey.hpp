@@ -296,6 +296,7 @@ private:
         append(key, value.nativeF16Fma);
         append(key, value.nativeF32MinMax);
         append(key, value.nativeF32IsNan);
+        append(key, value.heapStorageImages);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
         append(key, value.float32DenormPreserve);

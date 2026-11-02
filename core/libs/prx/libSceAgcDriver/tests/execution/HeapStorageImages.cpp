@@ -1,0 +1,331 @@
+// Heap storage images (PipelineSpecialization::HeapImageMode) against the image path: each case runs one compute
+// shader that loads a texel of a storage image (to an output buffer) and stores another, once through the bound image
+// (written back by StorageTexture::FlushPending) and once through the heap path (the T#'s tiled guest bytes through the
+// BDA page table). The guest surfaces and the loaded values must be equal byte for byte.
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
+#include "Recompiler.hpp"
+#include "PipelineSpecialization.hpp"
+#include "VulkanTestDevice.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace {
+
+using AgcDriver::Graphics::Require;
+using ShaderRecompiler::ShaderStage;
+
+constexpr std::uint32_t Threads = 256;
+constexpr std::uint32_t InputDwords = 16;
+constexpr std::size_t BlockBytes = 8u << 20u;
+constexpr std::size_t BlockAlignment = 65536;
+constexpr std::uint32_t Type2D = 9;
+constexpr std::uint32_t Type2DArray = 13;
+
+alignas(256) std::array<std::uint32_t, Threads * InputDwords> Input{};
+alignas(256) std::array<std::uint32_t, Threads * 4> Output{};
+
+// v1 = tid * 64; v[20:23] data, v[30:33] load address, v[34:37] store address (buffer s[0:3]); image_load
+// v[40:43] from s[4:11] to the output buffer s[12:15]; image_store v[20:23]. Word 6 / 12 carry the MIMG dimension.
+std::array<std::uint32_t, 17> ShaderCode(bool array) {
+    const std::uint32_t dim = array ? 5u : 1u;
+    return {
+        0x34020086u,
+        0xe0381000u, 0x80001401u,
+        0xe0381010u, 0x80001e01u,
+        0xe0381020u, 0x80002201u,
+        0xbf8c3f70u,
+        0xf0001f00u | (dim << 3u), 0x0001281eu,
+        0xbf8c3f70u,
+        0xe0781000u, 0x80032801u,
+        0xf0201f00u | (dim << 3u), 0x00011422u,
+        0xbf8c3f70u,
+        0xbf810000u,
+    };
+}
+
+class GuestBlock {
+public:
+    GuestBlock() {
+        block = static_cast<std::uint8_t*>(std::aligned_alloc(BlockAlignment, BlockBytes));
+        Require(block != nullptr, "heap storage images: cannot allocate a guest block");
+        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
+    }
+    ~GuestBlock() {
+        GuestAllocations::Mutation().Remove(block);
+        std::free(block);
+    }
+    GuestBlock(const GuestBlock&) = delete;
+    GuestBlock& operator=(const GuestBlock&) = delete;
+    std::uint8_t* Data() { return block; }
+
+private:
+    std::uint8_t* block = nullptr;
+};
+
+struct Case {
+    std::string name;
+    std::uint32_t format;
+    std::uint32_t tile;
+    std::uint32_t pipeBankXor;
+    std::uint32_t swizzle;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t slices;
+    std::uint32_t maxMip;
+    std::uint32_t level;
+};
+
+struct Rng {
+    std::uint64_t state;
+    std::uint32_t Next() {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        return static_cast<std::uint32_t>(state >> 16u);
+    }
+};
+
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+}
+
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* base, const Case& c) {
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base)) + c.pipeBankXor;
+    const bool array = c.slices > 1u;
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (c.format << 20u) | (((c.width - 1u) & 3u) << 30u),
+        ((c.width - 1u) >> 2u) | ((c.height - 1u) << 14u),
+        c.swizzle | (c.level << 12u) | (c.maxMip << 16u) | (c.tile << 20u) | ((array ? Type2DArray : Type2D) << 28u),
+        array ? c.slices - 1u : 0u,
+        c.maxMip << 4u,
+        0u,
+        0u,
+    };
+}
+
+std::uint64_t SurfaceBytes(const Case& c, const std::uint8_t* base) {
+    const auto words = TextureDescriptor(base, c);
+    const auto geometry = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(words));
+    Require(geometry.guestBytes + c.pipeBankXor <= BlockBytes, c.name + ": the surface does not fit the guest block");
+    return geometry.guestBytes;
+}
+
+void FillInput(const Case& c, std::uint64_t seed) {
+    Rng rng{seed * 0x9e3779b97f4a7c15ull + 1u};
+    const auto width = std::max(c.width >> c.level, 1u);
+    const auto height = std::max(c.height >> c.level, 1u);
+    const auto split = height / 2u;
+    std::vector<std::array<std::uint32_t, 3>> stores;
+    for (std::uint32_t slice = 0; slice < c.slices; ++slice) {
+        for (std::uint32_t y = split; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) stores.push_back({x, y, slice});
+        }
+    }
+    for (std::size_t i = stores.size(); i > 1u; --i) std::swap(stores[i - 1u], stores[rng.Next() % i]);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        auto* thread = Input.data() + tid * InputDwords;
+        for (std::uint32_t d = 0; d < 4u; ++d) thread[d] = rng.Next() ^ (rng.Next() << 16u);
+        // Some data dwords are special floats and small integers.
+        if (tid % 7u == 1u) thread[0] = 0x7fc00000u;
+        if (tid % 7u == 2u) thread[1] = 0x00000001u;
+        if (tid % 7u == 3u) thread[2] = 0x3f800000u;
+        if (tid % 7u == 4u) thread[3] = 0xbf000000u;
+        if (tid % 7u == 5u) thread[0] = 0x3effffffu;
+        if (split != 0u) {
+            thread[4] = rng.Next() % width;
+            thread[5] = rng.Next() % split;
+            thread[6] = rng.Next() % c.slices;
+        } else {
+            thread[4] = width + tid;
+            thread[5] = 0u;
+            thread[6] = 0u;
+        }
+        if (tid < stores.size()) {
+            thread[8] = stores[tid][0];
+            thread[9] = stores[tid][1];
+            thread[10] = stores[tid][2];
+        } else {
+            // Out of the level (x, y, or the slice of an array): the store is dropped.
+            const auto variant = tid % (c.slices > 1u ? 3u : 2u);
+            thread[8] = variant == 0u ? width + tid : tid % width;
+            thread[9] = variant == 1u ? height + tid : 0u;
+            thread[10] = variant == 2u ? c.slices + tid : 0u;
+        }
+    }
+}
+
+void FillSurface(std::uint8_t* surface, std::uint64_t bytes, std::uint64_t seed) {
+    Rng rng{seed * 0xbf58476d1ce4e5b9ull + 7u};
+    for (std::uint64_t i = 0; i < bytes; i += 4u) {
+        const auto value = rng.Next() ^ (rng.Next() << 16u);
+        std::memcpy(surface + i, &value, std::min<std::uint64_t>(4u, bytes - i));
+    }
+}
+
+struct Result {
+    std::vector<std::uint8_t> surface;
+    std::array<std::uint32_t, Threads * 4> output{};
+};
+
+Result Run(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, std::uint64_t seed, bool heap) {
+    const auto bytes = SurfaceBytes(c, block);
+    FillSurface(block, bytes + c.pipeBankXor, seed);
+    FillInput(c, seed);
+    Output.fill(0xdeadbeefu);
+    ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(heap);
+    const auto code = ShaderCode(c.slices > 1u);
+    std::vector<std::uint32_t> userData(16, 0u);
+    const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
+    const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
+    const auto texture = TextureDescriptor(block, c);
+    std::copy(input.begin(), input.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    std::copy(output.begin(), output.end(), userData.begin() + 12);
+    const std::span<const std::uint32_t> words(code);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(words.data()), std::as_bytes(words)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(words.data()), words, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    Require(request.target.heapStorageImages, "heap storage images: the device target has no heap cases (APS5_NO_HEAP_STORAGE is set)");
+    const auto result = ShaderRecompiler::Recompile(request);
+    // The texel load and the store are two resources of the same T#: the heap path binds neither image.
+    const auto images = std::ranges::count_if(result.bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages; });
+    Require(heap ? images == 0 : images != 0, c.name + (heap ? ": the heap path still binds images" : ": the image path binds no image"));
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(words.data()));
+    device.WaitIdle();
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), bytes + c.pipeBankXor, nullptr, "test");
+    device.WaitIdle();
+    ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(false);
+    Result run;
+    run.surface.assign(block, block + bytes + c.pipeBankXor);
+    run.output = Output;
+    return run;
+}
+
+std::string Hex(std::uint32_t value) {
+    char text[16];
+    std::snprintf(text, sizeof(text), "0x%08x", value);
+    return text;
+}
+
+bool Compare(const Case& c, const Result& image, const Result& heap) {
+    std::size_t surfaceDiffs = 0;
+    std::size_t first = image.surface.size();
+    for (std::size_t i = 0; i < image.surface.size(); ++i) {
+        if (image.surface[i] == heap.surface[i]) continue;
+        if (surfaceDiffs++ == 0u) first = i;
+    }
+    std::size_t outputDiffs = 0;
+    std::size_t firstOutput = 0;
+    for (std::size_t i = 0; i < image.output.size(); ++i) {
+        if (image.output[i] == heap.output[i]) continue;
+        if (outputDiffs++ == 0u) firstOutput = i;
+    }
+    if (surfaceDiffs == 0u && outputDiffs == 0u) {
+        std::printf("  ok   %s\n", c.name.c_str());
+        return true;
+    }
+    std::printf("  FAIL %s: %zu surface bytes differ", c.name.c_str(), surfaceDiffs);
+    if (surfaceDiffs != 0u) {
+        const auto word = first & ~std::size_t{3};
+        std::uint32_t a = 0, b = 0;
+        std::memcpy(&a, image.surface.data() + word, 4u);
+        std::memcpy(&b, heap.surface.data() + word, 4u);
+        std::printf(" (first at byte 0x%zx: image %s heap %s)", first, Hex(a).c_str(), Hex(b).c_str());
+    }
+    std::printf(", %zu loaded dwords differ", outputDiffs);
+    if (outputDiffs != 0u) {
+        const auto tid = firstOutput / 4u;
+        const auto* thread = Input.data() + tid * InputDwords;
+        std::printf(" (first: thread %zu component %zu at (%u, %u, %u): image %s heap %s)", tid, firstOutput % 4u, thread[4], thread[5], thread[6], Hex(image.output[firstOutput]).c_str(), Hex(heap.output[firstOutput]).c_str());
+    }
+    std::printf("\n");
+    return false;
+}
+
+std::vector<Case> Cases() {
+    struct Format {
+        const char* name;
+        std::uint32_t value;
+    };
+    constexpr std::array<Format, 18> Formats{{
+        {"32_UINT", 20u}, {"32_SINT", 21u}, {"32_FLOAT", 22u}, {"16_16_UNORM", 23u}, {"16_16_UINT", 27u}, {"16_16_FLOAT", 29u},
+        {"11_11_10_FLOAT", 36u}, {"10_10_10_2_UNORM", 50u}, {"8_8_8_8_UNORM", 56u}, {"8_8_8_8_SNORM", 57u}, {"8_8_8_8_UINT", 60u}, {"32_32_UINT", 62u},
+        {"32_32_FLOAT", 64u}, {"16_16_16_16_UNORM", 65u}, {"16_16_16_16_UINT", 69u}, {"16_16_16_16_FLOAT", 71u},
+        {"32_32_32_32_UINT", 75u}, {"32_32_32_32_FLOAT", 77u},
+    }};
+    struct Tile {
+        const char* name;
+        std::uint32_t value;
+        std::uint32_t pipeBankXor;
+    };
+    constexpr std::array<Tile, 6> Tiles{{
+        {"SW_4KB_S", 0x05u, 0u}, {"SW_64KB_S", 0x09u, 0u}, {"SW_64KB_Z_X", 0x18u, 0x5600u}, {"SW_64KB_S_X", 0x19u, 0x0300u},
+        {"SW_64KB_D_X", 0x1au, 0u}, {"SW_64KB_R_X", 0x1bu, 0xf100u},
+    }};
+    std::vector<Case> cases;
+    for (const auto& format : Formats) {
+        for (const auto& tile : Tiles) {
+            cases.push_back({std::string(format.name) + " " + tile.name + " 2D 200x70", format.value, tile.value, tile.pipeBankXor, 0xfacu, 200u, 70u, 1u, 0u, 0u});
+        }
+    }
+    for (const auto& format : {Formats[2], Formats[8], Formats[15], Formats[17]}) {
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X 480x270 mips 0..8 level 0", format.value, 0x1bu, 0x2200u, 0xfacu, 480u, 270u, 1u, 8u, 0u});
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X 480x270 mips 0..8 level 2", format.value, 0x1bu, 0x2200u, 0xfacu, 480u, 270u, 1u, 8u, 2u});
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X 480x270 mips 0..8 level 6 (tail)", format.value, 0x1bu, 0x2200u, 0xfacu, 480u, 270u, 1u, 8u, 6u});
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X 480x270 mips 0..8 level 8 (1x1, loads out of the level)", format.value, 0x1bu, 0x2200u, 0xfacu, 480u, 270u, 1u, 8u, 8u});
+        cases.push_back({std::string(format.name) + " SW_4KB_S 120x90 mips 0..6 level 3", format.value, 0x05u, 0u, 0xfacu, 120u, 90u, 1u, 6u, 3u});
+        cases.push_back({std::string(format.name) + " SW_64KB_S_X 2D array 96x40x3", format.value, 0x19u, 0x0300u, 0xfacu, 96u, 40u, 3u, 0u, 0u});
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X swizzle ZYXW", format.value, 0x1bu, 0u, 0xf2eu, 200u, 70u, 1u, 0u, 0u});
+        cases.push_back({std::string(format.name) + " SW_64KB_R_X swizzle X001", format.value, 0x1bu, 0u, 0x24cu, 200u, 70u, 1u, 0u, 0u});
+    }
+    return cases;
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        const std::string only = argc > 1 ? argv[1] : "";
+        GuestBlock imageBlock;
+        GuestBlock heapBlock;
+        std::size_t failed = 0;
+        std::size_t run = 0;
+        std::uint64_t seed = 1;
+        for (const auto& c : Cases()) {
+            ++seed;
+            if (!only.empty() && c.name.find(only) == std::string::npos) continue;
+            ++run;
+            const auto image = Run(*device, imageBlock.Data(), c, seed, false);
+            const auto heap = Run(*device, heapBlock.Data(), c, seed, true);
+            if (!Compare(c, image, heap)) ++failed;
+        }
+        std::printf("heap storage images: %zu of %zu cases equal the image path\n", run - failed, run);
+        return failed == 0u ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

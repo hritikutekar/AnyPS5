@@ -624,6 +624,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
         program.Info().usesDma = true;
         program.Info().usesFaultBuffer = true;
     }
+    if (request.target.heapStorageImages && request.target.bdaAbiVersion == BdaAbi::Version) ResourceMaterializer::PrepareHeapStorageImages(program);
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {

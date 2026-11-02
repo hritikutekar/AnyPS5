@@ -78,6 +78,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A storage image read and written as guest memory (PipelineSpecialization::HeapImageMode): the selector word and the
+// tiling words of its HeapImageBase specialization.
+struct HeapImageSelection {
+    std::uint32_t mode = 0;
+    std::array<std::uint32_t, 24> words{};
+};
+
 class ResourceMaterializer {
 public:
     static ViewLevelsPastChain LevelsPastChain(const DescriptorValue& descriptor);
@@ -92,6 +99,21 @@ public:
     static void PrepareDirectImageRefusals(IrProgram& program, bool faultAbi);
     static void ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal);
     static void PrepareImageModes(ShaderInfo& info);
+    // Heap storage images (SpirvTarget::heapStorageImages): ShaderInfo::heapImages marks the compute images whose
+    // every access is a 32-bit texel load or store of a 2D or 2D-array address (a texel load of a stored T# is its own
+    // sampled resource, so loads qualify too); the program gets the BDA page table and fault buffer their heap cases go
+    // through.
+    static bool HeapStorageCandidate(const IrProgram& program, std::uint32_t index);
+    static void PrepareHeapStorageImages(IrProgram& program);
+    // The element formats the heap cases are emitted for: 4, 8 and 16 bytes, so a texel is whole dwords and no store
+    // touches a neighbour's bytes.
+    static std::span<const IrBufferFormat> HeapStorageFormats();
+    // The heap mode of a heap storage image's descriptor when heap storage is selected and the heap path addresses
+    // it: a 2D (2D-array) surface of the image's dimension in a standard or 64 KiB XOR tile mode, base array 0, no
+    // metadata compression, a heap format; the T#'s base level is the one addressed. Selected by APS5_HEAP_STORAGE=1 (SetHeapStorageSelection).
+    static std::optional<HeapImageSelection> HeapImageSelectionFor(const ShaderInfo& info, std::uint32_t index, const DescriptorValue& descriptor);
+    static bool HeapStorageSelected();
+    static void SetHeapStorageSelection(bool selected);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static std::shared_ptr<const ResolvedImageTables> ResolveImageTablesShared(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey);
     static bool NullImageDescriptor(const ImageResource& image, const DescriptorValue& descriptor);

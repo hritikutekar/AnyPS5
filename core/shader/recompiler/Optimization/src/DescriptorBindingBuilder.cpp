@@ -340,8 +340,30 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         for (std::uint32_t word = 0; word < values.size() && !registrationModules; ++word) plan.specialization.push_back({first + word, values[word]});
     }
     std::vector<std::uint32_t> imageModes(info.images.size());
+    std::vector<std::optional<HeapImageSelection>> heapImages(info.heapImages != 0u && !registrationModules ? info.images.size() : 0u);
+    for (std::size_t index = 0; index < heapImages.size(); ++index) {
+        if (info.images[index].table == NoTable) heapImages[index] = ResourceMaterializer::HeapImageSelectionFor(info, static_cast<std::uint32_t>(index), snapshot.images.at(index));
+    }
+    // An image goes through the heap only if every other image of the dispatch over the same T# base does too: a texel
+    // stored through the heap must not be read back from an image (or the reverse) within the dispatch.
+    for (bool changed = !heapImages.empty(); changed;) {
+        changed = false;
+        for (std::size_t index = 0; index < heapImages.size(); ++index) {
+            if (!heapImages[index]) continue;
+            const auto& words = snapshot.images.at(index).dwords;
+            for (std::size_t other = 0; other < info.images.size(); ++other) {
+                if (other == index || heapImages[other] || info.images[other].table != NoTable || snapshot.images.at(other).dwordCount != 8u) continue;
+                const auto& alias = snapshot.images.at(other).dwords;
+                if (alias[0] != words[0] || (alias[1] & 0xffu) != (words[1] & 0xffu)) continue;
+                heapImages[index].reset();
+                changed = true;
+                break;
+            }
+        }
+    }
     for (std::size_t index = 0; index < info.images.size(); ++index) {
-        if (info.images[index].table == NoTable) imageModes[index] = ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
+        if (info.images[index].table != NoTable) continue;
+        imageModes[index] = !heapImages.empty() && heapImages[index] ? heapImages[index]->mode : ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -376,6 +398,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        if (index < 64u && ((info.heapImages >> index) & 1u) != 0u) {
+            // Every heap storage image's tiling words are supplied (zero when the image path is selected): a prepared
+            // module is specialized whole.
+            const auto heap = PipelineSpecialization::HeapImageBase + index * PipelineSpecialization::HeapImageWords;
+            for (std::uint32_t word = 0; word < PipelineSpecialization::HeapImageWords; ++word) plan.specialization.push_back({heap + word, heapImages[index] ? heapImages[index]->words[word] : 0u});
+        }
         const auto& image = info.images[index];
         if (image.resourceClass != ImageResourceClass::Storage || !image.written || image.atomic) continue;
         const auto code = (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu;
@@ -445,7 +473,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 if (image.table != NoTable) fail("an image table resource was placed in a typed heap");
                 mip = previous == resource ? mip + 1u : 0u;
                 previous = resource;
-                if (PipelineSpecialization::IsDeferredDirectImageMode(imageModes[resource])) {
+                if (PipelineSpecialization::IsDeferredDirectImageMode(imageModes[resource]) || PipelineSpecialization::IsHeapImageMode(imageModes[resource])) {
                     active = false;
                 } else {
                     const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);

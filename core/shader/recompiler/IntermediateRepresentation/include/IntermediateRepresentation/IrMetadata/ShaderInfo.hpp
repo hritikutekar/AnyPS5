@@ -37,6 +37,8 @@ struct ShaderInfo {
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;
     bool layerExported = false;
+    // Storage images compiled with heap storage cases (bit = resource; PrepareHeapStorageImages).
+    std::uint64_t heapImages = 0;
 
     bool operator==(const ShaderInfo& other) const = default;
 };
