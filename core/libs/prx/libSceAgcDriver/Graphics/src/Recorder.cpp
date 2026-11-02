@@ -1071,7 +1071,13 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
+        // CEILING EXPERIMENT ONLY (reads stale data on purpose; never a default): APS5_CEILING_NO_HOOK_WAITS=1 does not wait
+        // for pending GPU writes before a CPU read of guest memory (captures, indirect arguments, index scans).
+        static const bool ceilingNoHookWaits = [] {
+            const char* value = std::getenv("APS5_CEILING_NO_HOOK_WAITS");
+            return value != nullptr && *value == '1';
+        }();
+        if (auto* recorder = Recorder::Active(); !ceilingNoHookWaits && recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
