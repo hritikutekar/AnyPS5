@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <array>
 #include <unordered_set>
 #include <atomic>
@@ -86,6 +87,16 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
 void Driver::landPendingWaits(std::uint32_t queue) {
     auto& waits = pendingWaits();
     if (waits.empty()) return;
+    // CEILING EXPERIMENT ONLY (may read stale data; never a default): APS5_CEILING_NO_LAND_WAITS=1 drops the pending
+    // cross-ring waits instead of waiting for the GPU to run the producer's label store before a guest read.
+    static const bool ceilingNoLand = [] {
+        const char* value = std::getenv("APS5_CEILING_NO_LAND_WAITS");
+        return value != nullptr && *value == '1';
+    }();
+    if (ceilingNoLand) {
+        waits.clear();
+        return;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LandStats {
         std::uint64_t lands = 0, waited = 0;
@@ -100,6 +111,12 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
         const auto started = std::chrono::steady_clock::now();
         waitMemory(packet, queue, none, wait.received, false, true);
+        // Critical-path trace: a landed cross-ring wait waits for the GPU to run the producer's label store.
+        if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) {
+            const auto previous = std::exchange(AgcDriver::TraceDepTag, 2ull << 60u);
+            trace->Add("Driver.LandWait", nullptr, started, std::chrono::steady_clock::now());
+            AgcDriver::TraceDepTag = previous;
+        }
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         ++stats.waited;
         stats.waitedMs += ms;
@@ -422,6 +439,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 rings[queue].producer.store(producer, std::memory_order_relaxed);
             }
             GuestMemory::SpecWindowEnd(queue, (end == WaitEnd::Label || end == WaitEnd::Store) && producer < 256 && producer != queue, producer, endNs - beginNs);
+            AgcDriver::TraceDepTag = (1ull << 60u) | (static_cast<std::uint64_t>(static_cast<std::size_t>(end) + 1u) << 52u) | (producer & 0xffffu);
             if (queue != 0 || (end != WaitEnd::Label && end != WaitEnd::Store) || producer >= 256 || producer == 0) return;
             const auto total = endNs - beginNs;
             auto blocked = rings[producer].cumulativeNs.load(std::memory_order_relaxed) - cumulativeAtBegin[producer];

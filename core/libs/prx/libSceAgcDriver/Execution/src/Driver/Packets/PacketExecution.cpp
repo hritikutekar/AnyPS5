@@ -828,6 +828,7 @@ void Driver::execute(const Submission& submission) {
         }
         if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
+        TraceDepTag = 0;
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
         cursor = nextCursor;

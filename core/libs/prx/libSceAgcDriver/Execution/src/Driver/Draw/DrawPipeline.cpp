@@ -388,12 +388,17 @@ void DrawPipeline::run() {
     GuestMemory::SpecMarkReader(0, 1);
     for (;;) {
         Commit* commit = nullptr;
+        // Critical-path trace: the committer's wait for an item, as a slice (DrawPipeline.idle) when it waited.
+        auto* idleTrace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
+        const bool idleEmpty = idleTrace != nullptr && outstanding.load(std::memory_order_acquire) == 0;
+        const auto idleStart = idleEmpty ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            if (idleEmpty) idleTrace->Add("DrawPipeline.idle", nullptr, idleStart, std::chrono::steady_clock::now());
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             items.front().prepareTaken = true;

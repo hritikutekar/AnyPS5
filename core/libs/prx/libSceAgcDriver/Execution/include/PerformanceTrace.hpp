@@ -135,6 +135,11 @@ private:
 };
 
 inline thread_local std::uint64_t TraceBatchTag = 0;
+// Critical-path trace: the dependency a wait slice ended on, carried in the slice's "batch" value (bit 60 or 61 set, so
+// it cannot be a batch trace id; 0 none). The slice layout is shared with other modules' inline code: unchanged. Bits 60+: kind (1 cross-ring
+// wait: bits 52-59 how it ended (1 store, 2 label, 3 memory, 4 settled), bits 0-15 the producer queue; 2 GPU completion
+// wait: bits 0-47 the newest batch trace id waited for).
+inline thread_local std::uint64_t TraceDepTag = 0;
 
 class TraceThread {
 public:
@@ -200,7 +205,7 @@ public:
             folded = {};
         }
         if (length < MinimumSlice) folded += length;
-        else append({scope, stage, begin, length, TraceBatchTag});
+        else append({scope, stage, begin, length, TraceDepTag != 0 ? TraceDepTag : TraceBatchTag});
     }
 
     Snapshot Collect() const {
@@ -496,7 +501,7 @@ public:
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
             const auto folded = thread.name + " folded";
             for (const auto& slice : slices) {
-                char text[112];
+                char text[160];
                 if (slice.scope == nullptr) {
                     event(folded, "C", slice.begin, tid);
                     std::snprintf(text, sizeof text, ",\"args\":{\"ms\":%.3f}}", milliseconds(slice.length));

@@ -5003,6 +5003,8 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {
+    struct DepReset { ~DepReset() { TraceDepTag = 0; } } depReset;
+    TraceDepTag = 2ull << 60u;
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5055,6 +5057,8 @@ void Recorder::FinishThroughOpened(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    struct DepReset { ~DepReset() { TraceDepTag = 0; } } depReset;
+    if (!inFlight.empty() || open != nullptr) TraceDepTag = (2ull << 60u) | ((open != nullptr ? open->traceId : inFlight.back()->traceId) & 0xffffffffffffull);
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
