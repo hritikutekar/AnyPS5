@@ -13,7 +13,7 @@ namespace AgcDriver::Graphics {
 // Driver switches that may change while the game runs (the in-run A/B, APS5_AB). Each is an APS5_*
 // (mostly APS5_NO_*; APS5_QUIET_PUBLISH, APS5_LANE_SERIALIZE, APS5_SAMPLED_LATER_USE_REFUSAL and
 // APS5_DEFER_REFRESH_FLUSH, APS5_DEFER_FLIP_STORE, APS5_PIPELINE_DISPATCH(_MISSES) and
-// APS5_DISPATCH_ITEM_BDA_WRITES are opt-in)
+// APS5_DISPATCH_ITEM_BDA_WRITES and APS5_HEAP_STORAGE are opt-in)
 // variable whose presence selects one of two exact paths; it starts as set when the variable is set.
 // Every reader takes it once per operation (a build, a submission, a draw), so an operation never
 // sees both settings.
@@ -91,6 +91,8 @@ enum class RuntimeSwitch : std::size_t {
     NoLaneOpenWait,
     NoIndirectDispatchItems,
     NoFlipWaitKeep,
+    // Opt-in: heap storage images take the heap path (ResourceMaterializer::SetHeapStorageSelection).
+    HeapStorage,
     Count,
 };
 

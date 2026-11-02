@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -89,6 +90,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_LANE_OPEN_WAIT",
     "APS5_NO_INDIRECT_DISPATCH_ITEMS",
     "APS5_NO_FLIP_WAIT_KEEP",
+    "APS5_HEAP_STORAGE",
 };
 
 struct Refusal {
@@ -148,6 +150,8 @@ bool Set(RuntimeSwitch id) {
 
 void Assign(RuntimeSwitch id, bool set) {
     Values().set.at(static_cast<std::size_t>(id)).store(set, std::memory_order_relaxed);
+    // The recompiler's binding plans read the heap selection (their key holds what it selects).
+    if (id == RuntimeSwitch::HeapStorage) ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(set);
 }
 
 std::optional<RuntimeSwitch> Find(std::string_view name) {
