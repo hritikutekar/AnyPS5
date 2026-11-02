@@ -53,6 +53,32 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+// APS5_PROFILE_DRAW: [heap-storage] every 10 s, the builds whose shaders took heap storage images and their ranges.
+void CountHeapImageRanges(std::span<const ShaderRecompiler::HeapImageRange> ranges) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::uint64_t> builds{0}, written{0}, read{0}, bytes{0};
+    static std::atomic<std::int64_t> last{0};
+    builds.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& range : ranges) {
+        (range.written ? written : read).fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(range.end - range.begin, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (previous == 0) {
+        last.compare_exchange_strong(previous, now);
+        return;
+    }
+    if (now - previous < 10000 || !last.compare_exchange_strong(previous, now)) return;
+    std::fprintf(stderr, "[heap-storage] %.1f s: %llu builds with heap images, ranges %llu stored / %llu loaded, %.1f MiB\n", static_cast<double>(now - previous) / 1000.0,
+        static_cast<unsigned long long>(builds.exchange(0)), static_cast<unsigned long long>(written.exchange(0)), static_cast<unsigned long long>(read.exchange(0)), static_cast<double>(bytes.exchange(0)) / 1048576.0);
+}
+
+}
+
+namespace {
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -3111,6 +3137,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 if (range.written) guestMemory.AddWritable(range.begin, static_cast<std::size_t>(range.end - range.begin));
                 else guestMemory.AddReadable(range.begin, static_cast<std::size_t>(range.end - range.begin));
             }
+            if (!shader.program->heapImageRanges.empty()) CountHeapImageRanges(shader.program->heapImageRanges);
             std::uint64_t stageStorageBuffers = 0;
             std::uint64_t stageResources = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? colorAttachments : 0;
             Require(stageResources <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");
