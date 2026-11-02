@@ -2564,6 +2564,14 @@ namespace {
 // CEILING EXPERIMENT ONLY (renders wrong on purpose; never a default): APS5_CEILING_NO_COHERENCE=1 skips storage-image
 // coherence: Refresh treats the image as current (no flush of other images, no upload) and FlushPending writes nothing
 // back, so storage results never reach guest memory. It measures the most that keeping surfaces on the GPU could save.
+// =1 skips both, =2 only Refresh (no uploads), =3 only FlushPending (no write-backs).
+int CeilingCoherenceMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("APS5_CEILING_NO_COHERENCE");
+        return value != nullptr && *value >= '1' && *value <= '3' ? *value - '0' : 0;
+    }();
+    return mode;
+}
 bool CeilingNoCoherence() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_CEILING_NO_COHERENCE");
@@ -2576,7 +2584,7 @@ bool CeilingNoCoherence() {
 }
 
 bool StorageTexture::Refresh() {
-    if (CeilingNoCoherence()) return true;
+    if (CeilingNoCoherence() || CeilingCoherenceMode() == 2) return true;
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -4507,7 +4515,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
-    if (CeilingNoCoherence()) {
+    if (CeilingNoCoherence() || CeilingCoherenceMode() == 3) {
         if (published != nullptr) *published = false;
         return false;
     }
