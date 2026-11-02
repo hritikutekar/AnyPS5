@@ -1099,6 +1099,8 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    // Which images take the heap path depends on their bases (not in the key above) and on the driver's memory state.
+    if (variant.info.info.heapImages != 0u) key.push_back(ResourceMaterializer::SelectHeapImages(variant.info.info, snapshot));
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -1360,6 +1362,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }) || (artifact.registrationModule && std::any_of(plan->bindings.imageMetadata.begin(), plan->bindings.imageMetadata.end(), [](const PreparedImageMetadata& image) {
         return ((image.metadata.flags >> 1u) & RuntimeAbi::ImageModeMask) == RuntimeAbi::ImageModeMask;
     }));
+    result.heapImageRanges.clear();
+    for (const auto& range : plan->bindings.heapImageRanges) {
+        const auto base = ResourceMaterializer::HeapSurfaceBase(snapshot.images.at(range.resource), range.pipeBankXorMask);
+        result.heapImageRanges.push_back({base + range.begin, base + range.end, range.written});
+    }
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
@@ -2165,7 +2172,7 @@ std::uint64_t ResultHeapBytes(const RecompileResult& result) {
     bytes += vectorHeapBytes(result.vertexInputPatches) + vectorHeapBytes(result.runtimeImageResources) + vectorHeapBytes(result.vertexInputs);
     bytes += vectorHeapBytes(result.parameterExports) + vectorHeapBytes(result.fragmentParameters) + vectorHeapBytes(result.stencilReferences);
     bytes += vectorHeapBytes(result.specialization) + vectorHeapBytes(result.bindings) + vectorHeapBytes(result.pushConstants) + vectorHeapBytes(result.vertexAttributes);
-    bytes += vectorHeapBytes(result.imageTablePoison) + vectorHeapBytes(result.imageTableRanges) + vectorHeapBytes(result.imageTableReadRanges) + vectorHeapBytes(result.bindlessTables);
+    bytes += vectorHeapBytes(result.imageTablePoison) + vectorHeapBytes(result.imageTableRanges) + vectorHeapBytes(result.heapImageRanges) + vectorHeapBytes(result.imageTableReadRanges) + vectorHeapBytes(result.bindlessTables);
     for (const auto& binding : result.bindings) {
         bytes += vectorHeapBytes(binding.guestDescriptor) + vectorHeapBytes(binding.samplerDepthCompare) + vectorHeapBytes(binding.imageWritten) + vectorHeapBytes(binding.imageRead);
         bytes += vectorHeapBytes(binding.imageDepthCompare) + vectorHeapBytes(binding.imageAtomic) + vectorHeapBytes(binding.imageAtomic64) + vectorHeapBytes(binding.imageShapes);

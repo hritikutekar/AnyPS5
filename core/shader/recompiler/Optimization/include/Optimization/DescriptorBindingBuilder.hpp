@@ -40,11 +40,22 @@ bool BufferDescriptorPresent(const DescriptorValue& descriptor);
 BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor);
 BufferSubstitute SpecializedBufferFields(const BufferResource& buffer, IrShaderStage stage, const BufferSubstitute& fields);
 
+// A heap storage image's addressed range as offsets from its surface base (ResourceMaterializer::HeapSurfaceBase with
+// pipeBankXorMask): plans are shared by descriptors at other bases, so the absolute range is made per dispatch.
+struct PlannedHeapImageRange {
+    std::uint32_t resource;
+    std::uint32_t pipeBankXorMask;
+    std::uint64_t begin;
+    std::uint64_t end;
+    bool written;
+};
+
 struct DescriptorBindingPlan {
     std::vector<PreparedDescriptorBinding> bindings;
     std::vector<PreparedImageMetadata> imageMetadata;
     std::vector<PipelineSpecializationConstant> specialization;
     std::vector<std::uint32_t> runtimeState;
+    std::vector<PlannedHeapImageRange> heapImageRanges;
     bool storageData = false;
 };
 

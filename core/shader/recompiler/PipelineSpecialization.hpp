@@ -5,6 +5,16 @@
 
 namespace ShaderRecompiler {
 
+// The guest bytes [begin, end) a heap storage image addresses (its T#'s base level, one range per array slice) and
+// whether the shader stores to them (ShaderInvocation::heapImageRanges).
+struct HeapImageRange {
+    std::uint64_t begin;
+    std::uint64_t end;
+    bool written;
+
+    bool operator==(const HeapImageRange&) const = default;
+};
+
 struct PipelineSpecializationConstant {
     std::uint32_t id;
     std::uint32_t value;

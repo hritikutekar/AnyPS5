@@ -2934,6 +2934,14 @@ bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t 
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->context.device == device && surface->Overlaps(address, bytes); });
 }
 
+bool HeapRangeServedInPlace(std::uint64_t begin, std::uint64_t end) {
+    const auto allocation = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(begin), false);
+    if (allocation == nullptr || end > allocation->address + allocation->bytes) return false;
+    std::lock_guard lock(surfacesMutex());
+    if (!mayOverlap(begin, end - begin)) return true;
+    return std::none_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->active->load(std::memory_order_acquire) && !surface->retired && surface->Overlaps(begin, end - begin); });
+}
+
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
     depthRetireCalls.fetch_add(1, std::memory_order_relaxed);

@@ -32,6 +32,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
@@ -2354,6 +2355,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, state->surfaceFormat);
         state->presentation = std::make_unique<PresentationPass>(graphicsContext(), state->presentSlots.size());
     }
+    // Heap storage images take only ranges the BDA table serves in place and no depth surface overlaps.
+    ShaderRecompiler::ResourceMaterializer::SetHeapRangeFilter(&Graphics::HeapRangeServedInPlace);
     if (state->float32FlushToZeroCandidate) {
         const auto probeStart = std::chrono::steady_clock::now();
         state->probingFloatControls = true;

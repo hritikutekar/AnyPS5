@@ -280,6 +280,7 @@ function(add_shader_recompiler target runtimeTarget)
             ResourceMaterializer::FindBindlessInterface
             ResourceMaterializer::MaterializeNanoseconds
             ReleaseUndrawnResourcePlan
+            ResourceMaterializer::SetHeapRangeFilter
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity

@@ -864,6 +864,9 @@ struct ShaderInvocation {
     std::uint32_t imageTableFaults = 0;
     bool hasDeferredDirectImage = false;
     bool hasGuardedUnnormalizedWrap = false;
+    // Heap storage images: the guest ranges they address, which the driver binds through the BDA table like buffer
+    // ranges (a written one is noted as a pending write and marked written when recorded).
+    std::vector<HeapImageRange> heapImageRanges;
     std::vector<BindlessImageAbi::TableRegistration> bindlessTables;
 };
 

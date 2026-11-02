@@ -341,29 +341,17 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> imageModes(info.images.size());
     std::vector<std::optional<HeapImageSelection>> heapImages(info.heapImages != 0u && !registrationModules ? info.images.size() : 0u);
-    for (std::size_t index = 0; index < heapImages.size(); ++index) {
-        if (info.images[index].table == NoTable) heapImages[index] = ResourceMaterializer::HeapImageSelectionFor(info, static_cast<std::uint32_t>(index), snapshot.images.at(index));
-    }
-    // An image goes through the heap only if every other image of the dispatch over the same T# base does too: a texel
-    // stored through the heap must not be read back from an image (or the reverse) within the dispatch.
-    for (bool changed = !heapImages.empty(); changed;) {
-        changed = false;
-        for (std::size_t index = 0; index < heapImages.size(); ++index) {
-            if (!heapImages[index]) continue;
-            const auto& words = snapshot.images.at(index).dwords;
-            for (std::size_t other = 0; other < info.images.size(); ++other) {
-                if (other == index || heapImages[other] || info.images[other].table != NoTable || snapshot.images.at(other).dwordCount != 8u) continue;
-                const auto& alias = snapshot.images.at(other).dwords;
-                if (alias[0] != words[0] || (alias[1] & 0xffu) != (words[1] & 0xffu)) continue;
-                heapImages[index].reset();
-                changed = true;
-                break;
-            }
+    if (!heapImages.empty()) {
+        const auto selected = ResourceMaterializer::SelectHeapImages(info, snapshot);
+        for (std::size_t index = 0; index < heapImages.size() && index < 64u; ++index) {
+            if (((selected >> index) & 1u) != 0u) heapImages[index] = ResourceMaterializer::HeapImageSelectionFor(info, static_cast<std::uint32_t>(index), snapshot.images.at(index));
         }
     }
     for (std::size_t index = 0; index < info.images.size(); ++index) {
         if (info.images[index].table != NoTable) continue;
         imageModes[index] = !heapImages.empty() && heapImages[index] ? heapImages[index]->mode : ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
+        if (heapImages.empty() || !heapImages[index]) continue;
+        for (const auto& [begin, end] : heapImages[index]->ranges) plan.heapImageRanges.push_back({static_cast<std::uint32_t>(index), heapImages[index]->words[3], begin, end, info.images[index].written});
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -610,6 +598,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     }
     selected.imageMetadata = plan.imageMetadata;
     selected.runtimeState = plan.runtimeState;
+    selected.heapImageRanges = plan.heapImageRanges;
     return selected;
 }
 

@@ -87,8 +87,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 240, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 560, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(ShaderInvocation) == 264, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 584, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -631,6 +631,11 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     writer.Value(invocation.imageTableFaults);
     writer.Value(invocation.hasDeferredDirectImage);
     writer.Value(invocation.hasGuardedUnnormalizedWrap);
+    writer.List(invocation.heapImageRanges, [](Writer& out, const HeapImageRange& range) {
+        out.Value(range.begin);
+        out.Value(range.end);
+        out.Value(range.written);
+    });
     writer.List(invocation.bindlessTables, [](Writer& out, const BindlessImageAbi::TableRegistration& table) {
         out.Value(table.base);
         out.Value(table.records);
@@ -685,6 +690,11 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     reader.Value(invocation.imageTableFaults);
     reader.Value(invocation.hasDeferredDirectImage);
     reader.Value(invocation.hasGuardedUnnormalizedWrap);
+    reader.List(invocation.heapImageRanges, 17, [](Reader& in, HeapImageRange& range) {
+        in.Value(range.begin);
+        in.Value(range.end);
+        in.Value(range.written);
+    });
     reader.List(invocation.bindlessTables, 24, [](Reader& in, BindlessImageAbi::TableRegistration& table) {
         in.Value(table.base);
         in.Value(table.records);

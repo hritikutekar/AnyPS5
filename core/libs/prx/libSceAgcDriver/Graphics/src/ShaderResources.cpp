@@ -3104,6 +3104,13 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             }
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
             for (const auto& [base, bytes] : BindlessReadableRanges(*shader.program)) guestMemory.AddReadable(base, static_cast<std::size_t>(bytes));
+            // Heap storage images are guest ranges the shader addresses through the BDA table: bound like buffer ranges,
+            // so pending image results over them land first and a stored range is a pending write, marked written
+            // when recorded.
+            for (const auto& range : shader.program->heapImageRanges) {
+                if (range.written) guestMemory.AddWritable(range.begin, static_cast<std::size_t>(range.end - range.begin));
+                else guestMemory.AddReadable(range.begin, static_cast<std::size_t>(range.end - range.begin));
+            }
             std::uint64_t stageStorageBuffers = 0;
             std::uint64_t stageResources = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? colorAttachments : 0;
             Require(stageResources <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");

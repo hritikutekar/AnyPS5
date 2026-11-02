@@ -54,6 +54,10 @@ struct WrittenStorageExtent {
 void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents);
 bool DepthSurfaceAt(std::uint64_t address);
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+// Heap storage images (ResourceMaterializer::SetHeapRangeFilter): a range the BDA table serves in place (inside one
+// registered guest allocation) that no live depth surface of any device overlaps (a depth plane is kept apart from
+// guest memory: a texel stored or loaded through the heap would miss it).
+bool HeapRangeServedInPlace(std::uint64_t begin, std::uint64_t end);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
 void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageTexture>& storage);
 bool DepthSurfaceServesStorage(const Context& context, const StorageTexture& storage);

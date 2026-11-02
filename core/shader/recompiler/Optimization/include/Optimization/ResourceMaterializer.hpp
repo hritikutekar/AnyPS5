@@ -83,6 +83,8 @@ public:
 struct HeapImageSelection {
     std::uint32_t mode = 0;
     std::array<std::uint32_t, 24> words{};
+    // The addressed level's bytes as offsets from the surface base (HeapSurfaceBase), one range per array slice.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
 
 class ResourceMaterializer {
@@ -114,6 +116,16 @@ public:
     static std::optional<HeapImageSelection> HeapImageSelectionFor(const ShaderInfo& info, std::uint32_t index, const DescriptorValue& descriptor);
     static bool HeapStorageSelected();
     static void SetHeapStorageSelection(bool selected);
+    // The surface base of a heap image's T# (its base address without the pipe/bank XOR bits of `pipeBankXorMask`).
+    static std::uint64_t HeapSurfaceBase(const DescriptorValue& descriptor, std::uint32_t pipeBankXorMask);
+    // The images of a dispatch that take the heap path (bit per image): HeapImageSelectionFor, the driver's range filter
+    // on every addressed range (SetHeapRangeFilter), and no other image of the dispatch over the same T# base staying an
+    // image (a texel stored through the heap must not be read back from an image within the dispatch, or the reverse).
+    // It depends on base addresses, which binding plans are not keyed on: the plan key holds the result.
+    static std::uint64_t SelectHeapImages(const ShaderInfo& info, const ResourceSnapshot& snapshot);
+    // The driver's test of an absolute heap range [begin, end): guest memory the BDA table can serve in place and no
+    // surface the driver keeps apart from guest memory (a depth plane). None: every range passes.
+    static void SetHeapRangeFilter(bool (*filter)(std::uint64_t begin, std::uint64_t end));
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static std::shared_ptr<const ResolvedImageTables> ResolveImageTablesShared(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey);
     static bool NullImageDescriptor(const ImageResource& image, const DescriptorValue& descriptor);

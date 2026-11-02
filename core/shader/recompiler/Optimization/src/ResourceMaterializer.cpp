@@ -2812,12 +2812,14 @@ std::optional<HeapImageSelection> ResourceMaterializer::HeapImageSelectionFor(co
     std::uint64_t cursor = firstTail < mipCount ? (1ull << log2Block) : 0ull;
     std::uint64_t levelOffset = 0;
     std::uint32_t blocksPerRow = 1u;
+    std::uint64_t levelBytes = 1ull << log2Block;
     for (auto level = firstTail; level-- > 0u;) {
         const auto paddedWidth = alignUp(std::max(shiftCeil(width, level), 1u), blockWidth);
         const auto paddedHeight = alignUp(std::max(shiftCeil(height, level), 1u), blockHeight);
         if (level == baseLevel) {
             levelOffset = cursor;
             blocksPerRow = paddedWidth / blockWidth;
+            levelBytes = static_cast<std::uint64_t>(paddedWidth) * paddedHeight * elementBytes;
         }
         cursor += static_cast<std::uint64_t>(paddedWidth) * paddedHeight * elementBytes;
     }
@@ -2829,7 +2831,62 @@ std::optional<HeapImageSelection> ResourceMaterializer::HeapImageSelectionFor(co
     words[PipelineSpecialization::HeapImageLevelOffsetWord] = static_cast<std::uint32_t>(levelOffset);
     words[PipelineSpecialization::HeapImageBlocksPerRowWord] = blocksPerRow;
     words[PipelineSpecialization::HeapImageSliceBytesWord] = static_cast<std::uint32_t>(cursor);
+    const auto slices = dimension == RdnaImageDimension::Dim2DArray ? (w[4] & 0x1fffu) + 1u : 1u;
+    for (std::uint32_t slice = 0; slice < slices; ++slice) {
+        const auto begin = static_cast<std::uint64_t>(slice) * cursor + levelOffset;
+        selection.ranges.emplace_back(begin, begin + levelBytes);
+    }
     return selection;
+}
+
+std::uint64_t ResourceMaterializer::HeapSurfaceBase(const DescriptorValue& descriptor, std::uint32_t pipeBankXorMask) {
+    const auto base = ((static_cast<std::uint64_t>(descriptor.dwords[1] & 0xffu) << 32u) | descriptor.dwords[0]) << 8u;
+    return base - (base & pipeBankXorMask);
+}
+
+namespace {
+std::atomic<bool (*)(std::uint64_t, std::uint64_t)> heapRangeFilter{nullptr};
+}
+
+void ResourceMaterializer::SetHeapRangeFilter(bool (*filter)(std::uint64_t begin, std::uint64_t end)) {
+    heapRangeFilter.store(filter, std::memory_order_release);
+}
+
+std::uint64_t ResourceMaterializer::SelectHeapImages(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
+    if (info.heapImages == 0u || !HeapStorageSelected()) return 0u;
+    static const bool trace = std::getenv("APS5_HEAP_TRACE") != nullptr;
+    const auto filter = heapRangeFilter.load(std::memory_order_acquire);
+    std::uint64_t selected = 0;
+    for (std::uint32_t index = 0; index < info.images.size() && index < 64u; ++index) {
+        if (((info.heapImages >> index) & 1u) == 0u || info.images[index].table != NoTable) continue;
+        const auto& descriptor = snapshot.images.at(index);
+        const auto selection = HeapImageSelectionFor(info, index, descriptor);
+        if (!selection) continue;
+        const auto base = HeapSurfaceBase(descriptor, selection->words[3]);
+        const bool served = filter == nullptr || std::all_of(selection->ranges.begin(), selection->ranges.end(), [&](const auto& range) { return filter(base + range.first, base + range.second); });
+        if (!served) {
+            if (trace) std::fprintf(stderr, "[heap-storage] image %u at 0x%llx stays an image: the driver does not serve its range in place\n", index, static_cast<unsigned long long>(base));
+            continue;
+        }
+        selected |= std::uint64_t{1} << index;
+    }
+    for (bool changed = selected != 0u; changed;) {
+        changed = false;
+        for (std::uint32_t index = 0; index < info.images.size() && index < 64u; ++index) {
+            if (((selected >> index) & 1u) == 0u) continue;
+            const auto& words = snapshot.images.at(index).dwords;
+            for (std::uint32_t other = 0; other < info.images.size(); ++other) {
+                if (other == index || (other < 64u && ((selected >> other) & 1u) != 0u) || info.images[other].table != NoTable || snapshot.images.at(other).dwordCount != 8u) continue;
+                const auto& alias = snapshot.images.at(other).dwords;
+                if (alias[0] != words[0] || (alias[1] & 0xffu) != (words[1] & 0xffu)) continue;
+                if (trace) std::fprintf(stderr, "[heap-storage] image %u stays an image: image %u over the same base does\n", index, other);
+                selected &= ~(std::uint64_t{1} << index);
+                changed = true;
+                break;
+            }
+        }
+    }
+    return selected;
 }
 
 void ResourceMaterializer::ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal) {

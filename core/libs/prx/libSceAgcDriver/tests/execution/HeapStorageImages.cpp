@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Recompiler.hpp"
 #include "PipelineSpecialization.hpp"
@@ -20,6 +21,9 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <tuple>
+#include <deque>
+#include <initializer_list>
 #include <vector>
 
 namespace {
@@ -35,7 +39,11 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 
 alignas(256) std::array<std::uint32_t, Threads * InputDwords> Input{};
-alignas(256) std::array<std::uint32_t, Threads * 4> Output{};
+// Lane tid's loaded texel lands at dword tid * InputDwords (the shader stores it at the input's byte offset).
+alignas(256) std::array<std::uint32_t, Threads * InputDwords> Output{};
+// Every dispatch reads its input from a copy at an address no other dispatch used: the input is not guest memory the
+// driver watches, so a buffer it uploaded before could be taken for unchanged.
+std::deque<std::vector<std::uint32_t>> Inputs;
 
 // v1 = tid * 64; v[20:23] data, v[30:33] load address, v[34:37] store address (buffer s[0:3]); image_load
 // v[40:43] from s[4:11] to the output buffer s[12:15]; image_store v[20:23]. Word 6 / 12 carry the MIMG dimension.
@@ -125,14 +133,22 @@ std::uint64_t SurfaceBytes(const Case& c, const std::uint8_t* base) {
     return geometry.guestBytes;
 }
 
-void FillInput(const Case& c, std::uint64_t seed) {
+// Phase 0 loads from the upper half of the level and stores into the lower half; phase 1 (a second dispatch over the
+// same surface) loads the texels phase 0 stored and stores into the upper half.
+void FillInput(const Case& c, std::uint64_t seed, std::uint32_t phase = 0) {
+    std::vector<std::array<std::uint32_t, 3>> previous;
+    if (phase == 1u) {
+        FillInput(c, seed, 0u);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) previous.push_back({Input[tid * InputDwords + 8u], Input[tid * InputDwords + 9u], Input[tid * InputDwords + 10u]});
+        seed += 0x51u;
+    }
     Rng rng{seed * 0x9e3779b97f4a7c15ull + 1u};
     const auto width = std::max(c.width >> c.level, 1u);
     const auto height = std::max(c.height >> c.level, 1u);
     const auto split = height / 2u;
     std::vector<std::array<std::uint32_t, 3>> stores;
     for (std::uint32_t slice = 0; slice < c.slices; ++slice) {
-        for (std::uint32_t y = split; y < height; ++y) {
+        for (std::uint32_t y = phase == 0u ? split : 0u; y < (phase == 0u ? height : split); ++y) {
             for (std::uint32_t x = 0; x < width; ++x) stores.push_back({x, y, slice});
         }
     }
@@ -167,6 +183,15 @@ void FillInput(const Case& c, std::uint64_t seed) {
             thread[10] = variant == 2u ? c.slices + tid : 0u;
         }
     }
+    if (phase == 1u) {
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            auto* thread = Input.data() + tid * InputDwords;
+            const auto& at = previous[(tid * 37u) % Threads];
+            thread[4] = at[0];
+            thread[5] = at[1];
+            thread[6] = at[2];
+        }
+    }
 }
 
 void FillSurface(std::uint8_t* surface, std::uint64_t bytes, std::uint64_t seed) {
@@ -179,18 +204,16 @@ void FillSurface(std::uint8_t* surface, std::uint64_t bytes, std::uint64_t seed)
 
 struct Result {
     std::vector<std::uint8_t> surface;
-    std::array<std::uint32_t, Threads * 4> output{};
+    std::array<std::uint32_t, Threads * InputDwords> output{};
 };
 
-Result Run(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, std::uint64_t seed, bool heap) {
-    const auto bytes = SurfaceBytes(c, block);
-    FillSurface(block, bytes + c.pipeBankXor, seed);
-    FillInput(c, seed);
+void Dispatch(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, bool heap) {
     Output.fill(0xdeadbeefu);
     ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(heap);
     const auto code = ShaderCode(c.slices > 1u);
     std::vector<std::uint32_t> userData(16, 0u);
-    const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
+    const auto& copy = Inputs.emplace_back(Input.begin(), Input.end());
+    const auto input = BufferDescriptor(copy.data(), static_cast<std::uint32_t>(copy.size() * 4u));
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
     const auto texture = TextureDescriptor(block, c);
     std::copy(input.begin(), input.end(), userData.begin());
@@ -213,9 +236,22 @@ Result Run(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, 
     Require(heap ? images == 0 : images != 0, c.name + (heap ? ": the heap path still binds images" : ": the image path binds no image"));
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(words.data()));
     device.WaitIdle();
+    ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(false);
+}
+
+// One dispatch per path in `paths` over the same surface (phase 0, then phase 1), with no flush between them: an
+// image's stores are still pending in it when the next dispatch runs. Then the surface lands and is compared.
+Result Run(AgcDriver::VulkanDevice& device, std::uint8_t* block, const Case& c, std::uint64_t seed, std::initializer_list<bool> paths) {
+    const auto bytes = SurfaceBytes(c, block);
+    FillSurface(block, bytes + c.pipeBankXor, seed);
+    std::uint32_t phase = 0;
+    for (const bool heap : paths) {
+        FillInput(c, seed, phase++);
+        Dispatch(device, block, c, heap);
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(block), bytes + c.pipeBankXor);
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), bytes + c.pipeBankXor, nullptr, "test");
     device.WaitIdle();
-    ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(false);
     Result run;
     run.surface.assign(block, block + bytes + c.pipeBankXor);
     run.output = Output;
@@ -241,6 +277,9 @@ bool Compare(const Case& c, const Result& image, const Result& heap) {
         if (image.output[i] == heap.output[i]) continue;
         if (outputDiffs++ == 0u) firstOutput = i;
     }
+    std::size_t unwritten = 0;
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) unwritten += image.output[tid * InputDwords] == 0xdeadbeefu && image.output[tid * InputDwords + 1u] == 0xdeadbeefu;
+    if (unwritten != 0u) std::printf("  note %s: %zu lanes of the reference wrote no loaded texel\n", c.name.c_str(), unwritten);
     if (surfaceDiffs == 0u && outputDiffs == 0u) {
         std::printf("  ok   %s\n", c.name.c_str());
         return true;
@@ -255,9 +294,9 @@ bool Compare(const Case& c, const Result& image, const Result& heap) {
     }
     std::printf(", %zu loaded dwords differ", outputDiffs);
     if (outputDiffs != 0u) {
-        const auto tid = firstOutput / 4u;
+        const auto tid = firstOutput / InputDwords;
         const auto* thread = Input.data() + tid * InputDwords;
-        std::printf(" (first: thread %zu component %zu at (%u, %u, %u): image %s heap %s)", tid, firstOutput % 4u, thread[4], thread[5], thread[6], Hex(image.output[firstOutput]).c_str(), Hex(heap.output[firstOutput]).c_str());
+        std::printf(" (first: thread %zu component %zu at (%u, %u, %u): image %s heap %s)", tid, firstOutput % InputDwords, thread[4], thread[5], thread[6], Hex(image.output[firstOutput]).c_str(), Hex(heap.output[firstOutput]).c_str());
     }
     std::printf("\n");
     return false;
@@ -308,7 +347,8 @@ int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        const std::string only = argc > 1 ? argv[1] : "";
+        const bool mixed = argc > 1 && std::string(argv[1]) == "--mixed";
+        const std::string only = argc > (mixed ? 2 : 1) ? argv[mixed ? 2 : 1] : "";
         GuestBlock imageBlock;
         GuestBlock heapBlock;
         std::size_t failed = 0;
@@ -318,9 +358,30 @@ int main(int argc, char** argv) {
             ++seed;
             if (!only.empty() && c.name.find(only) == std::string::npos) continue;
             ++run;
-            const auto image = Run(*device, imageBlock.Data(), c, seed, false);
-            const auto heap = Run(*device, heapBlock.Data(), c, seed, true);
-            if (!Compare(c, image, heap)) ++failed;
+            if (!mixed) {
+                const auto image = Run(*device, imageBlock.Data(), c, seed, {false});
+                const auto heap = Run(*device, heapBlock.Data(), c, seed, {true});
+                if (!Compare(c, image, heap)) ++failed;
+                continue;
+            }
+            // The second dispatch loads what the first stored, through the other path or the same one.
+            const auto reference = Run(*device, imageBlock.Data(), c, seed, {false, false});
+            bool equal = true;
+            for (const auto& [first, second, label] : {std::tuple{false, true, "image then heap"}, std::tuple{true, false, "heap then image"}, std::tuple{true, true, "heap then heap"}}) {
+                auto named = c;
+                named.name += std::string(": ") + label;
+                equal = Compare(named, reference, Run(*device, heapBlock.Data(), c, seed, {first, second})) && equal;
+            }
+            // 32_UINT stores its data dword unchanged: the second dispatch's loads must return what the first stored.
+            if (c.format == 20u && c.level == 0u && c.slices == 1u) {
+                const auto result = Run(*device, heapBlock.Data(), c, seed, {false, true});
+                FillInput(c, seed, 0u);
+                std::size_t hits = 0;
+                for (std::uint32_t tid = 0; tid < Threads; ++tid) hits += result.output[tid * InputDwords] == Input[((tid * 37u) % Threads) * InputDwords];
+                std::printf("  %s: %zu of %u second-dispatch loads return the first dispatch's stores (image then heap)\n", c.name.c_str(), hits, Threads);
+                equal = equal && hits == Threads;
+            }
+            if (!equal) ++failed;
         }
         std::printf("heap storage images: %zu of %zu cases equal the image path\n", run - failed, run);
         return failed == 0u ? 0 : 1;
