@@ -1598,6 +1598,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 namespace {
 void specNoteRead(std::uint64_t address, std::size_t bytes);
+void landAuditNote(std::uint64_t address, std::size_t bytes);
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
@@ -2000,6 +2001,7 @@ void specNoteStore(std::uint64_t address, std::size_t bytes) {
     }
 }
 void specNoteRead(std::uint64_t address, std::size_t bytes) {
+    landAuditNote(address, bytes);
     if (specRing < 0 || bytes == 0) return;
     auto& spec = Spec();
     if (spec.freshCount.load(std::memory_order_relaxed) == 0) return;
@@ -2825,7 +2827,43 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&PrepareHostRead);
 }
 
+namespace {
+thread_local bool landAuditOn = false;
+thread_local bool landAuditInside = false;
+thread_local std::vector<AuditedRead> landAuditReads;
+thread_local std::uint64_t landAuditDropped = 0;
+constexpr std::size_t LandAuditCap = 1u << 18;
+void landAuditNote(std::uint64_t address, std::size_t bytes) {
+    if (!landAuditOn || landAuditInside || bytes == 0) return;
+    if (landAuditReads.size() >= LandAuditCap) {
+        ++landAuditDropped;
+        return;
+    }
+    landAuditInside = true;
+    const auto generation = CollectWrites(address, bytes);
+    landAuditInside = false;
+    landAuditReads.push_back({address, address + bytes, generation, static_cast<std::uint8_t>(CurrentReadSite())});
+}
+}
+
+void BeginLandAudit() {
+    landAuditOn = true;
+    landAuditReads.clear();
+    landAuditDropped = 0;
+}
+
+bool LandAuditActive() {
+    return landAuditOn;
+}
+
+std::vector<AuditedRead> TakeLandAudit(std::uint64_t* dropped) {
+    landAuditOn = false;
+    if (dropped != nullptr) *dropped = landAuditDropped;
+    return std::exchange(landAuditReads, {});
+}
+
 void GuardRead(std::uint64_t address, std::size_t bytes) {
+    landAuditNote(address, bytes);
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
 }
 
@@ -2978,6 +3016,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 }
 
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
+    landAuditNote(address, bytes.size());
     requireNotSpeculative("compare");
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
@@ -2992,6 +3031,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 }
 
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
+    landAuditNote(address, out.size());
     requireNotSpeculative("copy");
     if (out.empty()) return Compare::Equal;
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;

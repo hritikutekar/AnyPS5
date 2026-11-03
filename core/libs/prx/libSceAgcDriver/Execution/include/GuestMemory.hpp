@@ -249,6 +249,19 @@ unsigned long long CodeOffset(const void* address);
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
+// Diagnostic (APS5_LAND_AUDIT=1): while active on the calling thread, every guest read through this interface (reads,
+// mapped copies and compares, the write tracker's queries) is recorded with the tracker generation after collecting its
+// range; TakeLandAudit stops and returns them. A later UnchangedSinceCollected(range, generation) == false means a CPU
+// store landed in the range after the read.
+struct AuditedRead {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::uint64_t generation;
+    std::uint8_t site;
+};
+void BeginLandAudit();
+bool LandAuditActive();
+std::vector<AuditedRead> TakeLandAudit(std::uint64_t* dropped = nullptr);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes);
 class ISpeculativeReadGate {

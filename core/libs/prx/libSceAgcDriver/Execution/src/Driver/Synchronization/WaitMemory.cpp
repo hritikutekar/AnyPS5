@@ -9,6 +9,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
 #include <unordered_set>
 #include <atomic>
@@ -86,6 +87,119 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
 
 void Driver::landPendingWaits(std::uint32_t queue) {
     auto& waits = pendingWaits();
+    // Diagnostic (APS5_LAND_AUDIT=1, skips the landings like APS5_CEILING_NO_LAND_WAITS): from a wait that would land
+    // until the owed waits pass in memory, every guest read of this ring is recorded (GuestMemory::BeginLandAudit); when
+    // they pass, a read whose range a CPU store reached after it is a hazard: landing would have read the newer bytes.
+    static const bool landAudit = [] {
+        const char* value = std::getenv("APS5_LAND_AUDIT");
+        const bool on = value != nullptr && *value == '1';
+        if (on) std::fprintf(stderr, "[land-audit] APS5_LAND_AUDIT=1: landings skipped and audited (diagnostic)\n");
+        return on;
+    }();
+    if (landAudit) {
+        struct AuditState {
+            std::vector<PendingWait> owed;
+            std::uint64_t openedSerial = 0;
+            std::uint64_t windows = 0, reads = 0, hazards = 0, hazardWindows = 0, dropped = 0;
+            std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> bySite{};
+            std::map<std::uint64_t, std::uint64_t> ranges;
+            // Targeted-landing estimate: windows whose reads touch a page that had a hazard before (learned per ring,
+            // kept across reports), and of the windows with a hazard, those whose hazard pages were all learned before.
+            std::uint64_t wouldLand = 0, missedNew = 0;
+            std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+        };
+        static thread_local AuditState audit;
+        if (!audit.owed.empty()) {
+            // Passed in memory, or the GPU finished every batch open when the window opened (the producer's label is
+            // in one of them): an equality wait on a counter that moved on never passes in memory again.
+            bool completed = false;
+            {
+                std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
+                if (settleLock.owns_lock()) {
+                    if (const auto localDevice = device.Load(); localDevice != nullptr) {
+                        completed = std::all_of(audit.owed.begin(), audit.owed.end(), [&](const PendingWait& wait) {
+                            const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
+                            const std::size_t bytes = Pm4::WaitAwaitedBytes(packet);
+                            const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(bytes == 8 ? ~7ull : ~3ull)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                            return localDevice->RecordedWritesSettled(awaited, bytes);
+                        });
+                    }
+                }
+            }
+            const bool passed = completed || std::all_of(audit.owed.begin(), audit.owed.end(), [](const PendingWait& wait) { return Pm4::WaitSatisfiedUnchecked(std::span<const std::uint32_t>(wait.words).first(wait.count)); });
+            if (passed) {
+                std::uint64_t dropped = 0;
+                const auto reads = GuestMemory::TakeLandAudit(&dropped);
+                static thread_local std::unordered_set<std::uint64_t> learned;
+                const auto touchesLearned = [&](const GuestMemory::AuditedRead& read) {
+                    for (auto page = read.begin & ~0xfffull; page < read.end; page += 0x1000) {
+                        if (learned.contains(page)) return true;
+                    }
+                    return false;
+                };
+                const bool lands = std::any_of(reads.begin(), reads.end(), touchesLearned);
+                std::uint64_t found = 0;
+                bool unlearnedHazard = false;
+                std::vector<std::uint64_t> hazardPages;
+                for (const auto& read : reads) {
+                    if (GuestMemory::UnchangedSinceCollected(read.begin, static_cast<std::size_t>(read.end - read.begin), read.generation)) continue;
+                    ++found;
+                    ++audit.bySite[read.site];
+                    ++audit.ranges[read.begin & ~0xfffull];
+                    if (!touchesLearned(read)) unlearnedHazard = true;
+                    static thread_local int samples = 0;
+                    if (samples < 12) {
+                        ++samples;
+                        std::array<std::uint32_t, 16> words{};
+                        const auto count = std::min<std::size_t>(words.size(), static_cast<std::size_t>((read.end - read.begin + 3) / 4));
+                        static_cast<void>(GuestMemory::CopyMapped(read.begin & ~3ull, std::as_writable_bytes(std::span(words).first(std::max<std::size_t>(count, 1)))));
+                        std::string text;
+                        for (std::size_t i = 0; i < std::max<std::size_t>(count, 1); ++i) {
+                            char item[12];
+                            std::snprintf(item, sizeof(item), " %08x", words[i]);
+                            text += item;
+                        }
+                        std::fprintf(stderr, "[land-audit-sample] queue 0x%x site %s read 0x%llx+0x%llx now:%s\n", queue, GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(read.site)), static_cast<unsigned long long>(read.begin), static_cast<unsigned long long>(read.end - read.begin), text.c_str());
+                    }
+                    for (auto page = read.begin & ~0xfffull; page < read.end; page += 0x1000) hazardPages.push_back(page);
+                }
+                audit.wouldLand += lands ? 1u : 0u;
+                audit.missedNew += unlearnedHazard ? 1u : 0u;
+                learned.insert(hazardPages.begin(), hazardPages.end());
+                ++audit.windows;
+                audit.reads += reads.size();
+                audit.hazards += found;
+                audit.hazardWindows += found != 0 ? 1u : 0u;
+                audit.dropped += dropped;
+                audit.owed.clear();
+            }
+        }
+        if (!waits.empty()) {
+            if (audit.owed.empty()) GuestMemory::BeginLandAudit();
+            audit.owed.insert(audit.owed.end(), waits.begin(), waits.end());
+            waits.clear();
+        }
+        if (std::chrono::steady_clock::now() - audit.reported > std::chrono::seconds(10)) {
+            std::string sites, top;
+            for (std::size_t site = 0; site < audit.bySite.size(); ++site) {
+                if (audit.bySite[site] != 0) sites += " " + std::string(GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site))) + " " + std::to_string(audit.bySite[site]);
+            }
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranked(audit.ranges.begin(), audit.ranges.end());
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (std::size_t i = 0; i < ranked.size() && i < 6; ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " 0x%llx x%llu", static_cast<unsigned long long>(ranked[i].first), static_cast<unsigned long long>(ranked[i].second));
+                top += text;
+            }
+            std::fprintf(stderr, "[land-audit] queue 0x%x (10 s): %llu windows closed, %llu reads audited (%llu over the cap), %llu hazard reads in %llu windows; by site:%s; top pages:%s; targeted: %llu windows would land (read a learned page), %llu windows with a hazard on a page not learned yet\n", queue, static_cast<unsigned long long>(audit.windows), static_cast<unsigned long long>(audit.reads), static_cast<unsigned long long>(audit.dropped), static_cast<unsigned long long>(audit.hazards), static_cast<unsigned long long>(audit.hazardWindows), sites.c_str(), top.c_str(), static_cast<unsigned long long>(audit.wouldLand), static_cast<unsigned long long>(audit.missedNew));
+            const auto owed = std::move(audit.owed);
+            const auto openedSerial = audit.openedSerial;
+            audit = AuditState{};
+            audit.owed = owed;
+            audit.openedSerial = openedSerial;
+        }
+        return;
+    }
     if (waits.empty()) return;
     // CEILING EXPERIMENT ONLY (may read stale data; never a default): APS5_CEILING_NO_LAND_WAITS=1 drops the pending
     // cross-ring waits instead of waiting for the GPU to run the producer's label store before a guest read.
