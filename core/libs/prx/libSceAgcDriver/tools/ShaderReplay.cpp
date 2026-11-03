@@ -70,6 +70,7 @@ int g_requests = 0;
 bool g_noReference = false;
 bool g_variants = false;
 bool g_describe = false;
+bool g_images = false;
 bool g_nativeTarget = false;
 bool g_bindless = false;
 std::string g_expectedSpirv;
@@ -84,6 +85,7 @@ void ConfigurePipelineReplay(int argc, char** argv) {
         if (option == "--no-reference") g_noReference = true;
         if (option == "--fingerprint-variants") g_variants = true;
         if (option == "--describe") g_describe = true;
+        if (option == "--images") g_images = true;
         if (option == "--native-target") g_nativeTarget = true;
         if (option == "--prepare-only") prepare = true;
         if (option == "--maintenance8") maintenance = true;
@@ -402,6 +404,39 @@ void InspectSpirv(const char* path, std::span<const std::uint32_t> words) {
 
 bool Replay(const char* path, std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
+    // --images: the program's image resources and whether the bindless (device table) path takes each.
+    if (g_images) {
+        auto target = request.request.target;
+        target.bindlessImages = true;
+        auto bindlessRequest = request.request;
+        bindlessRequest.target = target;
+        const auto program = ShaderRecompiler::PrepareResourceProgram(bindlessRequest);
+        auto info = program.Info();
+        ShaderRecompiler::ResourceMaterializer::PrepareImageModes(info);
+        const auto stage = program.Resources().stage;
+        std::printf("  captured target: bindlessImages %d\n", request.request.target.bindlessImages ? 1 : 0);
+        std::printf("  images: %zu (runtime mode lists %zu), buffers %zu\n", info.images.size(), info.runtimeImageModes.size(), info.buffers.size());
+        for (std::uint32_t i = 0; i < info.images.size(); ++i) {
+            const auto& image = info.images[i];
+            std::printf("    image %u: class %s, table %s, table operation %s, runtime modes %zu, read %d written %d atomic %d, dimension %u -> bindless %s\n", i,
+                image.resourceClass == ShaderRecompiler::ImageResourceClass::Sampled ? "sampled" : image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage ? "storage" : "none",
+                image.table == ShaderRecompiler::NoTable ? "none" : std::to_string(image.table).c_str(),
+                image.tableOperation == ShaderRecompiler::TableOperation::Supported ? "supported" : "unsupported",
+                i < info.runtimeImageModes.size() ? info.runtimeImageModes[i].size() : 0u, image.read, image.written, image.atomic, static_cast<unsigned>(image.dimension),
+                ShaderRecompiler::ResourceMaterializer::BindlessImage(info, stage, i) ? "yes" : "no");
+        }
+        try {
+            auto compileRequest = bindlessRequest;
+            compileRequest.useCache = false;
+            const auto result = ShaderRecompiler::Recompile(compileRequest);
+            std::printf("  compiled with bindlessImages: bindlessHeap %d, bindings:", result.bindlessHeap ? 1 : 0);
+            for (const auto& binding : result.bindings) std::printf(" %u", static_cast<unsigned>(binding.role));
+            std::printf("\n");
+        } catch (const std::exception& error) {
+            std::printf("  compile failed: %s\n", error.what());
+        }
+        return true;
+    }
     if (g_nativeTarget) {
         if (!device) device = std::make_unique<AgcDriver::VulkanDevice>();
         const auto native = device->ComputeTarget(request.request.context.waveSize);

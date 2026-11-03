@@ -282,6 +282,8 @@ function(add_shader_recompiler target runtimeTarget)
             ReleaseUndrawnResourcePlan
             ResourceMaterializer::SetHeapRangeFilter
             ResourceMaterializer::SetHeapStorageSelection
+            ResourceMaterializer::SetBindlessTableCaptureSkip
+            ResourceMaterializer::BindlessTableCaptureSkipped
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity

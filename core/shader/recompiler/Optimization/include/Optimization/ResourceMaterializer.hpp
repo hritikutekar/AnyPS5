@@ -115,6 +115,12 @@ public:
     // metadata compression, a heap format; the T#'s base level is the one addressed. Selected by APS5_HEAP_STORAGE=1 (SetHeapStorageSelection).
     static std::optional<HeapImageSelection> HeapImageSelectionFor(const ShaderInfo& info, std::uint32_t index, const DescriptorValue& descriptor);
     static bool HeapStorageSelected();
+    // Bindless table capture skip (the driver sets it while bindless images run in lazy mode, the texture service fed by
+    // the shaders' miss ring; APS5_NO_BINDLESS_TABLE_SKIP off, a runtime switch): a capture does not snapshot an image
+    // table whose every user is a bindless image (the shader reads its records on the GPU), so the CPU neither reads nor
+    // resolves its records nor validates them.
+    static void SetBindlessTableCaptureSkip(bool skip);
+    static bool BindlessTableCaptureSkipped();
     static void SetHeapStorageSelection(bool selected);
     // The surface base of a heap image's T# (its base address without the pipe/bank XOR bits of `pipeBankXorMask`).
     static std::uint64_t HeapSurfaceBase(const DescriptorValue& descriptor, std::uint32_t pipeBankXorMask);

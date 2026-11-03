@@ -19,6 +19,10 @@ class Buffer;
 class Recorder;
 
 bool BindlessImagesRequested();
+// Set by the device once bindless images run in lazy mode (the texture service fed by the miss ring): captures may then
+// skip image tables used only by bindless images (RuntimeSwitch::NoBindlessTableSkip turns the skip off).
+void ArmBindlessTableSkip();
+bool BindlessTableSkipArmed();
 
 struct BindlessFeatureSupport {
     bool bufferDeviceAddress = false;

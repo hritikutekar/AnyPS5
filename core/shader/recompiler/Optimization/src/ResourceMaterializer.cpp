@@ -741,8 +741,20 @@ public:
         const auto started = std::chrono::steady_clock::now();
         tables.shader = plan.shaderHash;
         tables.tables.resize(count);
+        // A table whose every user is a bindless image (ResourceMaterializer::BindlessTableCaptureSkipped) is not read:
+        // its column stays empty, so neither the resolution nor the bindless registrations walk it.
+        std::vector<bool> needed(count, false);
+        const bool skipBindless = ResourceMaterializer::BindlessTableCaptureSkipped();
+        for (std::uint32_t index = 0; index < plan.info.images.size(); ++index) {
+            const auto& image = plan.info.images[index];
+            if (image.table == NoTable) continue;
+            if (!skipBindless || !ResourceMaterializer::BindlessImage(plan.info, plan.stage, index)) needed[image.table] = true;
+        }
+        for (const auto& sampler : plan.info.samplers) {
+            if (sampler.table != NoTable) needed[sampler.table] = true;
+        }
         for (const auto& image : plan.info.images) {
-            if (image.table != NoTable) Snapshot(image.source, image.table);
+            if (image.table != NoTable && needed[image.table]) Snapshot(image.source, image.table);
         }
         for (const auto& sampler : plan.info.samplers) {
             if (sampler.table != NoTable) Snapshot(sampler.source, sampler.table);
@@ -2099,6 +2111,18 @@ BindlessInterfaceRegistry& bindlessInterfaces() {
     return registry;
 }
 
+}
+
+namespace {
+std::atomic<bool> bindlessTableCaptureSkip{false};
+}
+
+void ResourceMaterializer::SetBindlessTableCaptureSkip(bool skip) {
+    bindlessTableCaptureSkip.store(skip, std::memory_order_relaxed);
+}
+
+bool ResourceMaterializer::BindlessTableCaptureSkipped() {
+    return bindlessTableCaptureSkip.load(std::memory_order_relaxed);
 }
 
 bool ResourceMaterializer::BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource) {

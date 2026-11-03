@@ -93,6 +93,8 @@ enum class RuntimeSwitch : std::size_t {
     NoFlipWaitKeep,
     // A refresh with no same-shape alias discards other-format images' pending results inside its memory (B step 1).
     NoAliasDiscard,
+    // Captures snapshot image tables used only by bindless images (ResourceMaterializer::SetBindlessTableCaptureSkip).
+    NoBindlessTableSkip,
     // Opt-in: heap storage images take the heap path (ResourceMaterializer::SetHeapStorageSelection).
     HeapStorage,
     Count,

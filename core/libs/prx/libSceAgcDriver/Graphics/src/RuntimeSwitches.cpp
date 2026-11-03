@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <array>
@@ -91,6 +92,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_INDIRECT_DISPATCH_ITEMS",
     "APS5_NO_FLIP_WAIT_KEEP",
     "APS5_NO_ALIAS_DISCARD",
+    "APS5_NO_BINDLESS_TABLE_SKIP",
     "APS5_HEAP_STORAGE",
 };
 
@@ -153,6 +155,8 @@ void Assign(RuntimeSwitch id, bool set) {
     Values().set.at(static_cast<std::size_t>(id)).store(set, std::memory_order_relaxed);
     // The recompiler's binding plans read the heap selection (their key holds what it selects).
     if (id == RuntimeSwitch::HeapStorage) ShaderRecompiler::ResourceMaterializer::SetHeapStorageSelection(set);
+    // The skip applies only while the device runs bindless images in lazy mode (VulkanDevice arms it).
+    if (id == RuntimeSwitch::NoBindlessTableSkip) ShaderRecompiler::ResourceMaterializer::SetBindlessTableCaptureSkip(!set && BindlessTableSkipArmed());
 }
 
 std::optional<RuntimeSwitch> Find(std::string_view name) {

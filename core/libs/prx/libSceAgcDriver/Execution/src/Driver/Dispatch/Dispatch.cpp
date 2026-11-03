@@ -21,6 +21,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <set>
 #include <atomic>
 #include <string>
 #include <cstdlib>
@@ -559,6 +560,21 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             throw std::runtime_error(where + reason);
         }
         recompileMs += phaseTiming.Elapsed();
+        // Diagnostic (APS5_PROFILE_DRAW): once per program, whether its compile used the bindless heap and how many CPU
+        // image-table bindings it has ([bindless-use]).
+        {
+            static const bool profileUse = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (profileUse && compiledResult != nullptr) {
+                static std::mutex usedMutex;
+                static std::set<std::uint64_t> seen;
+                std::lock_guard usedLock(usedMutex);
+                if (seen.insert(address).second) {
+                    std::size_t tables = 0;
+                    for (const auto& binding : compiledResult->bindings) tables += binding.role == ShaderRecompiler::DescriptorRole::ImageTable ? 1u : 0u;
+                    if (tables != 0 || compiledResult->bindlessHeap) std::fprintf(stderr, "[bindless-use] program 0x%llx queue 0x%x: bindless heap %d, CPU image tables %zu, target bindless %d\n", static_cast<unsigned long long>(address), submission.queue, compiledResult->bindlessHeap ? 1 : 0, tables, request.target.bindlessImages ? 1 : 0);
+                }
+            }
+        }
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }

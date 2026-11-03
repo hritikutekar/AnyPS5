@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "DeviceImageTableAbi.hpp"
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -27,6 +28,18 @@ std::size_t RingWords(std::uint32_t capacity) {
     return Abi::RingRecordsWord + static_cast<std::size_t>(capacity) * Abi::RecordWords;
 }
 
+}
+
+namespace {
+std::atomic<bool> bindlessTableSkipArmed{false};
+}
+
+void ArmBindlessTableSkip() {
+    bindlessTableSkipArmed.store(true, std::memory_order_relaxed);
+}
+
+bool BindlessTableSkipArmed() {
+    return bindlessTableSkipArmed.load(std::memory_order_relaxed);
 }
 
 bool BindlessImagesRequested() {

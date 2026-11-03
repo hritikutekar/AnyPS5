@@ -2163,6 +2163,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
             descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
             state->bindlessImages = true;
+            // Lazy bindless (the texture service fed by the shaders' miss ring): captures skip image tables used only by
+            // bindless images (APS5_NO_BINDLESS_TABLE_SKIP=1 off, a runtime switch).
+            if (const char* lazy = std::getenv("APS5_BINDLESS_LAZY"); lazy != nullptr && std::string_view(lazy) == "1") {
+                Graphics::ArmBindlessTableSkip();
+                ShaderRecompiler::ResourceMaterializer::SetBindlessTableCaptureSkip(!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoBindlessTableSkip));
+            }
             if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) != 0 && (state->subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) state->capabilities.push_back(spv::CapabilityGroupNonUniformQuad);
         }
     }
