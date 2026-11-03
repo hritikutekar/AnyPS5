@@ -91,6 +91,8 @@ enum class RuntimeSwitch : std::size_t {
     NoLaneOpenWait,
     NoIndirectDispatchItems,
     NoFlipWaitKeep,
+    // A refresh with no same-shape alias discards other-format images' pending results inside its memory (B step 1).
+    NoAliasDiscard,
     // Opt-in: heap storage images take the heap path (ResourceMaterializer::SetHeapStorageSelection).
     HeapStorage,
     Count,

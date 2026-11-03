@@ -90,6 +90,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_LANE_OPEN_WAIT",
     "APS5_NO_INDIRECT_DISPATCH_ITEMS",
     "APS5_NO_FLIP_WAIT_KEEP",
+    "APS5_NO_ALIAS_DISCARD",
     "APS5_HEAP_STORAGE",
 };
 

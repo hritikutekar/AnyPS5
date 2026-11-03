@@ -135,6 +135,7 @@ std::atomic<std::uint64_t> overwriteRefreshes{0}, overwriteUploadsSkipped{0}, ov
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0};
+std::atomic<std::uint64_t> aliasDiscardRefreshes{0}, aliasDiscarded{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0}, clearHandOvers{0}, handedOverSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -241,6 +242,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu (%llu flushes with nothing to store skipped the check%s), evicted stale %llu, refresh flushes deferred %llu, flip stores deferred %llu, GPU-read flushes deferred %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(heldReadSkips), RuntimeSwitches::Set(RuntimeSwitch::NoHeldReadSkip) ? ", APS5_NO_HELD_READ_SKIP" : "", take(staleEvicted), take(deferredRefreshFlushes), take(deferredFlipStores), take(deferredGpuReadFlushes));
+    AgcDriver::ProfilePrint_nid_no_patch("[alias-discard] (10 s) refreshes that dropped other-format images' pending results: %llu (%llu images or unit groups)%s\n", take(aliasDiscardRefreshes), take(aliasDiscarded), RuntimeSwitches::Set(RuntimeSwitch::NoAliasDiscard) ? ", APS5_NO_ALIAS_DISCARD" : "");
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     if (!traffic.surfaces.empty()) {
@@ -2685,6 +2687,18 @@ bool StorageTexture::Refresh() {
     if (overwrite) {
         overwriteRefreshes.fetch_add(1, std::memory_order_relaxed);
         overwriteUnitsDropped.fetch_add(DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(elementExtent)), std::memory_order_relaxed);
+    }
+    // B step 1 (APS5_NO_ALIAS_DISCARD=1 off, a runtime switch): with no same-shape alias to borrow from, the pending results
+    // of other images inside this image's memory that do not view the same data (another format, not a cast view) are
+    // dead to it: the title's transient pool binds a new surface over a finished one, and on the PS5 the new surface's
+    // passes overwrite those bytes. They are dropped instead of written back (and this image is not re-uploaded from
+    // them). Same-format views (a probe's mip or face views) and cast views stay pending and are flushed as before.
+    // Measured 2026-11-03: +2.7 % menu (best725), rendering like the good runs (best727).
+    if (alias == nullptr && !handOverKeys.has_value() && !RuntimeSwitches::Set(RuntimeSwitch::NoAliasDiscard)) {
+        if (const auto dropped = DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(elementExtent), &descriptor); dropped != 0) {
+            aliasDiscardRefreshes.fetch_add(1, std::memory_order_relaxed);
+            aliasDiscarded.fetch_add(dropped, std::memory_order_relaxed);
+        }
     }
     const bool flushed = !handOverKeys.has_value() && FlushPending(descriptor.baseAddress, static_cast<std::size_t>(elementExtent), alias.get(), "storage refresh", PublishScope::None);
     if (profile) NoteRefreshOutcome(flushed, alias != nullptr, aliasRejected, overlapKind);
@@ -5298,7 +5312,16 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     return identities;
 }
 
-std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes) {
+namespace {
+
+bool ViewsSameData(const GuestTextureResource& theirs, const GuestTextureResource& ours) {
+    if (theirs.format == ours.format) return true;
+    return BytesPerElement(theirs.format) == BytesPerElement(ours.format) && theirs.tileMode == ours.tileMode && theirs.width == ours.width && theirs.height == ours.height;
+}
+
+}
+
+std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes, const GuestTextureResource* keepViewsOf) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     std::size_t discarded = 0;
@@ -5307,6 +5330,10 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     for (auto it = pending.textures.begin(); it != pending.textures.end();) {
         auto* texture = *it;
         const auto begin = texture->descriptor.baseAddress;
+        if (keepViewsOf != nullptr && ViewsSameData(texture->descriptor, *keepViewsOf)) {
+            ++it;
+            continue;
+        }
         if (texture != exempt && begin >= address && begin + texture->guestBytes <= end) {
             // The content no longer matches guest memory anywhere: the next use re-uploads once the
             // fill stamped the range, never from a matching `original` (the fill may not have

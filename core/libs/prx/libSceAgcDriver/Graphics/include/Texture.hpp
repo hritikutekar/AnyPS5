@@ -418,7 +418,9 @@ public:
     static std::size_t ClearByKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key);
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
-    static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes);
+    // `keepViewsOf`: images that view that image's data stay pending (same format, or a cast view: same element size,
+    // tiling and dimensions).
+    static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes, const GuestTextureResource* keepViewsOf = nullptr);
     // A fill of the whole surface (`layer` WholeImage) or of one array layer with the 16-byte
     // `pattern`, done as a GPU clear of the image instead of a store into guest memory: the
     // pattern must be one texel of the storage format repeated, exactly representable as a clear
