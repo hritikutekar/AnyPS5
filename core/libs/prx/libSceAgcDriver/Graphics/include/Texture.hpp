@@ -305,6 +305,7 @@ public:
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
+    static bool flushPendingTimed(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published);
     static void FlushAllPending(const char* reason);
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);

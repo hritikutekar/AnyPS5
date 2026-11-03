@@ -4531,7 +4531,47 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+// Diagnostic (APS5_PROFILE_DRAW): wall time of the outermost FlushPending calls per thread ([flush-time] every 10 s).
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static thread_local int depth = 0;
+    if (!profile || depth != 0) return flushPendingTimed(address, bytes, except, reason, scope, published);
+    ++depth;
+    const auto started = std::chrono::steady_clock::now();
+    struct Done {
+        std::chrono::steady_clock::time_point started;
+        ~Done() {
+            --depth;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+            static std::mutex mutex;
+            static std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> byThread;
+            static auto last = std::chrono::steady_clock::now();
+            char name[32] = "?";
+            pthread_getname_np(pthread_self(), name, sizeof(name));
+            std::lock_guard lock(mutex);
+            auto& row = byThread[std::string(name) + "/" + (reason != nullptr ? reason : "?")];
+            row.first += static_cast<std::uint64_t>(ns);
+            ++row.second;
+            if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(10)) {
+                last = std::chrono::steady_clock::now();
+                std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> ranked(byThread.begin(), byThread.end());
+                std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+                std::string line;
+                for (std::size_t i = 0; i < ranked.size() && i < 14; ++i) {
+                    char item[128];
+                    std::snprintf(item, sizeof(item), " %s %.0f ms / %llu;", ranked[i].first.c_str(), ranked[i].second.first / 1e6, static_cast<unsigned long long>(ranked[i].second.second));
+                    line += item;
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("[flush-time] (10 s) FlushPending wall time by thread (ms / calls):%s\n", line.c_str());
+                byThread.clear();
+            }
+        }
+        const char* reason;
+    } done{started, reason};
+    return flushPendingTimed(address, bytes, except, reason, scope, published);
+}
+
+bool StorageTexture::flushPendingTimed(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (CeilingNoCoherence() || CeilingCoherenceMode() == 3 || (CeilingCoherenceMode() == 4 && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) {
         if (published != nullptr) *published = false;
         return false;
