@@ -2564,11 +2564,14 @@ namespace {
 // CEILING EXPERIMENT ONLY (renders wrong on purpose; never a default): APS5_CEILING_NO_COHERENCE=1 skips storage-image
 // coherence: Refresh treats the image as current (no flush of other images, no upload) and FlushPending writes nothing
 // back, so storage results never reach guest memory. It measures the most that keeping surfaces on the GPU could save.
-// =1 skips both, =2 only Refresh (no uploads), =3 only FlushPending (no write-backs).
+// =1 skips both, =2 only Refresh (no uploads), =3 only FlushPending (no write-backs), =4 only the write-backs a storage
+// refresh makes of another image over the same memory (an alias view handing its results over through guest memory).
 int CeilingCoherenceMode() {
     static const int mode = [] {
         const char* value = std::getenv("APS5_CEILING_NO_COHERENCE");
-        return value != nullptr && *value >= '1' && *value <= '3' ? *value - '0' : 0;
+        const int parsed = value != nullptr && *value >= '1' && *value <= '4' ? *value - '0' : 0;
+        if (parsed >= 2) std::fprintf(stderr, "[ceiling] APS5_CEILING_NO_COHERENCE=%d (rendering is WRONG on purpose)\n", parsed);
+        return parsed;
     }();
     return mode;
 }
@@ -4515,7 +4518,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
-    if (CeilingNoCoherence() || CeilingCoherenceMode() == 3) {
+    if (CeilingNoCoherence() || CeilingCoherenceMode() == 3 || (CeilingCoherenceMode() == 4 && reason != nullptr && std::strcmp(reason, "storage refresh") == 0)) {
         if (published != nullptr) *published = false;
         return false;
     }
