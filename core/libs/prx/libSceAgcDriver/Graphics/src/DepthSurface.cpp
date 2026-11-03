@@ -2444,6 +2444,32 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
     return ranges;
 }
 
+std::size_t DiscardDepthPlanes(std::uint64_t address, std::size_t bytes) {
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (!overlapsStalePlane(address, end)) return 0;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    std::size_t dropped = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> remaining;
+    for (const auto& surface : surfaces()) {
+        if (!surface->memoryStale) continue;
+        const auto resource = mirrorResource(surface->target);
+        const auto plane = surface->target.address;
+        const auto planeBytes = DescribeSurface(resource).guestBytes;
+        if (plane >= end || address >= plane + planeBytes || plane == address) {
+            remaining.emplace_back(plane, plane + planeBytes);
+            continue;
+        }
+        surface->memoryStale = false;
+        ++dropped;
+    }
+    auto& planes = stalePlanes();
+    std::lock_guard staleLock(planes.mutex);
+    planes.ranges = std::move(remaining);
+    publishStaleHull(planes);
+    return dropped;
+}
+
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
     if (userData.size() < 6 || numThreads[0] != 64 || numThreads[1] != 1 || numThreads[2] != 1) return 0;
     if (!HtileMaskKernelCode(code)) return 0;

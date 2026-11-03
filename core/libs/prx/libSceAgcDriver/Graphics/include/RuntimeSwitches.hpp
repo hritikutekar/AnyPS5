@@ -95,6 +95,8 @@ enum class RuntimeSwitch : std::size_t {
     NoAliasDiscard,
     // Captures snapshot image tables used only by bindless images (ResourceMaterializer::SetBindlessTableCaptureSkip).
     NoBindlessTableSkip,
+    // A colour texture over a transient depth plane drops the plane's pending results instead of storing them.
+    NoDepthAliasDiscard,
     // Opt-in: heap storage images take the heap path (ResourceMaterializer::SetHeapStorageSelection).
     HeapStorage,
     Count,

@@ -3763,6 +3763,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
+std::atomic<std::uint64_t> depthAliasDiscards{0};
 
 }
 
@@ -4316,7 +4317,34 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
+        // A colour texture over a transient depth plane's memory (the title's pool: a half-res depth buffer inside a
+        // 1080p colour surface) does not view the plane's data: its pending results are dropped, not stored with a GPU
+        // wait and re-uploaded (APS5_NO_DEPTH_ALIAS_DISCARD=1 off, a runtime switch).
+        if (!RuntimeSwitches::Set(RuntimeSwitch::NoDepthAliasDiscard) && DiscardDepthPlanes(address, bytes) != 0) depthAliasDiscards.fetch_add(1, std::memory_order_relaxed);
+        if (const auto stored = FlushDepthPlanes(address, bytes); !stored.empty()) {
+            // Diagnostic (APS5_PROFILE_DRAW): once per texture, a sampled texture over a depth plane ([depth-as-texture]).
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (profile) {
+                static std::mutex seenMutex;
+                static std::map<std::uint64_t, std::uint64_t> counts;
+                static auto last = std::chrono::steady_clock::now();
+                std::lock_guard seenLock(seenMutex);
+                const auto& resource = surface.resource;
+                if (counts[address]++ == 0) std::fprintf(stderr, "[depth-as-texture] texture 0x%llx+0x%zx %ux%u fmt %u tile %u mips %u dim %u base array %u last array %u over %zu depth plane store(s)\n", static_cast<unsigned long long>(address), bytes, resource.width, resource.height, static_cast<unsigned>(resource.format), static_cast<unsigned>(resource.tileMode), resource.mipCount, static_cast<unsigned>(resource.dimension), resource.baseArray, resource.depthOrLastArray, stored.size());
+                if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(10)) {
+                    last = std::chrono::steady_clock::now();
+                    std::string line;
+                    for (const auto& [where, count] : counts) {
+                        char item[48];
+                        std::snprintf(item, sizeof(item), " 0x%llx x%llu", static_cast<unsigned long long>(where), static_cast<unsigned long long>(count));
+                        line += item;
+                    }
+                    std::fprintf(stderr, "[depth-as-texture] (10 s) template revalidations that stored a depth plane, by texture:%s; depth planes dropped by colour textures over them %llu\n", line.c_str(), static_cast<unsigned long long>(depthAliasDiscards.exchange(0)));
+                    for (auto& [where, count] : counts) count = count != 0 ? 1u : 0u;
+                }
+            }
+            return fail(FastFail::Changed);
+        }
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         bool committedProof = false;
         bool untracked = false;
