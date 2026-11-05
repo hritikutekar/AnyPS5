@@ -381,6 +381,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             }
         }
     }
+    for (std::uint32_t index = 0; index < snapshot.tableFormats.size() && !registrationModules; ++index) plan.specialization.push_back({PipelineSpecialization::TableFormatBase + index, snapshot.tableFormats[index]});
     for (std::uint32_t index = 0; index < info.images.size() && !registrationModules; ++index) {
         if (info.images[index].table != NoTable) continue;
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;

@@ -412,6 +412,15 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.otherFaults <= 1, "incomplete or invalid BDA fault record");
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
+    // A record table changed its format after the capture: the guarded dispatch stopped, the next capture reads the table
+    // again and compiles for what it finds. Not an error of the title's.
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::TableFormat) {
+        static std::atomic<std::uint64_t> seen{0};
+        const auto count = seen.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (count <= 8u || count % 1000u == 0u) std::fprintf(stderr, "[table-format] guard hit %llu: descriptor at 0x%llx, instruction 0x%llx, stage %u\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(report.address), static_cast<unsigned long long>(report.instruction), static_cast<unsigned>(report.stage));
+        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        return;
+    }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);

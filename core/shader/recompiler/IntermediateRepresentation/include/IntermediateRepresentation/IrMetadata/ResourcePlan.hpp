@@ -141,6 +141,8 @@ struct ResourceSnapshot {
     std::vector<SrtReadPoison> srtPoison;
     std::uint32_t nullRootReads = 0;
     ImageTableSnapshot tables;
+    // One per ShaderInfo::tableFormatColumns: the format every record agrees on, else 0.
+    std::vector<std::uint32_t> tableFormats;
 };
 
 struct UniformFillPlan {

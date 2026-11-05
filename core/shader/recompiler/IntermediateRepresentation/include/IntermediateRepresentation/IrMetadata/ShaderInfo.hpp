@@ -9,6 +9,17 @@
 
 namespace ShaderRecompiler {
 
+// A buffer descriptor's format word read at run time from a record table: the table's V# in four flat SRT slots, the
+// record stride, and the byte offset of the word in a record. The driver reads the column at capture; when every record
+// agrees, the loads compile for that format (SpirvRuntimeBuffer.cpp, PipelineSpecialization::TableFormatBase).
+struct TableFormatColumn {
+    std::array<std::uint32_t, 4> tableSlots{};
+    std::uint32_t stride = 0;
+    std::uint32_t offset = 0;
+
+    bool operator==(const TableFormatColumn&) const = default;
+};
+
 struct ShaderInfo {
     std::uint32_t scratchDwords = 0;
     std::uint32_t sharedMemoryBytes = 0;
@@ -39,6 +50,7 @@ struct ShaderInfo {
     bool layerExported = false;
     // Storage images compiled with heap storage cases (bit = resource; PrepareHeapStorageImages).
     std::uint64_t heapImages = 0;
+    std::vector<TableFormatColumn> tableFormatColumns;
 
     bool operator==(const ShaderInfo& other) const = default;
 };

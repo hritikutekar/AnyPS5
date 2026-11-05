@@ -78,6 +78,9 @@ inline constexpr std::uint32_t ExportBlendBase = 8244u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t LevelsPastViewBase = 8384u;
+// ShaderInfo::tableFormatColumns: the column's format when every record agrees, else 0 (the run-time decoder).
+inline constexpr std::uint32_t TableFormatBase = 9216u;
+inline constexpr std::uint32_t MaxTableFormatColumns = 32u;
 inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
 inline constexpr std::uint32_t StoreQuantizeWords = 4u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;

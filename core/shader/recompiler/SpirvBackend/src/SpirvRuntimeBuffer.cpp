@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
 #include "PipelineSpecialization.hpp"
+#include "Optimization/include/Optimization/TableFormats.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <array>
@@ -778,6 +779,24 @@ std::uint32_t formattedDispatch(SpirvValueEmitContext& context, const IrValue& i
         const auto format = static_cast<IrBufferFormat>((word->ImmediateU32() >> 12u) & 0x7fu);
         if (format == IrBufferFormat::Invalid) context.Fail(instruction, "formatted buffer instruction has an invalid constant format");
         return formatted(context, instruction, resource, GetFormatInfo(format), components, store, data);
+    }
+    // A format word from a record table the driver read at capture: a known format compiles this load for it, behind a
+    // guard for a table changed since, and the specializer drops the run-time decoder the helper inlines at every call
+    // (best846: world +8.4 %, GPU busy -15 %). Unknown (0) keeps the decoder.
+    if (memory.gpuDescriptor && !store) {
+        if (const auto column = TableFormatColumnOf(state.program, instruction)) {
+            const auto& columns = state.program.Info().tableFormatColumns;
+            if (const auto found = std::find(columns.begin(), columns.end(), *column); found != columns.end()) {
+                const auto index = static_cast<std::uint32_t>(found - columns.begin());
+                const auto known = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::TableFormatBase + index, 0u);
+                const auto type = components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
+                return EmitValueIfElse(state, nonzero(state, known), type, [&] {
+                    const auto mismatch = Unary(state, spv::OpLogicalNot, TypeBool(state), equal(state, field(state, resource.word3, 12u, 7u), known));
+                    faultIf(context, instruction, mismatch, resource.base, 0u, BdaAbi::FaultReason::TableFormat);
+                    return genericFormattedLoad(context, instruction, resource, components, known, static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float));
+                }, [&] { return formattedGpuCall(context, instruction, resource, components, store, data); });
+            }
+        }
     }
     if (!memory.gpuDescriptor) return formattedCall(context, instruction, resource, components, store, data);
     return formattedGpuCall(context, instruction, resource, components, store, data);

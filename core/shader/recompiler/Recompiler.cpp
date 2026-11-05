@@ -43,6 +43,7 @@
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
+#include "Optimization/include/Optimization/TableFormats.hpp"
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
@@ -342,6 +343,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program, request.target.bindlessImages);
     deadCodeEliminator.Eliminate(program);
+    CollectTableFormatColumns(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
     if (request.context.convertedSamples) {
@@ -1099,6 +1101,8 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    // A table format is a specialization constant of the plan: the first dispatch may see an empty table.
+    for (const auto format : snapshot.tableFormats) key.push_back(format);
     // Which images take the heap path depends on their bases (not in the key above) and on the driver's memory state.
     if (variant.info.info.heapImages != 0u) key.push_back(ResourceMaterializer::SelectHeapImages(variant.info.info, snapshot));
     static PrimedSharedMutex mutex;

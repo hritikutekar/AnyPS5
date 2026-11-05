@@ -1460,6 +1460,35 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.buffers.assign(values.begin(), values.begin() + plan.info.buffers.size());
     cursor += plan.info.buffers.size();
+    // Table format columns: read through the capture, so a changed word invalidates it like any other read. A column
+    // whose records disagree, or that cannot be read, stays 0: its loads keep the run-time decoder.
+    snapshot.tableFormats.assign(plan.info.tableFormatColumns.size(), 0u);
+    for (std::size_t index = 0; index < plan.info.tableFormatColumns.size() && runtime.readWords != nullptr; ++index) {
+        const auto& column = plan.info.tableFormatColumns[index];
+        if (std::any_of(column.tableSlots.begin(), column.tableSlots.end(), [&](std::uint32_t slot) { return slot >= snapshot.flattenedSrt.size(); })) continue;
+        const auto word0 = snapshot.flattenedSrt[column.tableSlots[0]];
+        const auto word1 = snapshot.flattenedSrt[column.tableSlots[1]];
+        const auto word2 = snapshot.flattenedSrt[column.tableSlots[2]];
+        const std::uint64_t base = word0 | (static_cast<std::uint64_t>(word1 & 0xffffu) << 32u);
+        const auto stride = (word1 >> 16u) & 0x3fffu;
+        const auto records = stride != 0u ? word2 : word2 / column.stride;
+        if (base == 0u || records == 0u || records > 4096u) continue;
+        std::uint32_t agreed = 0u;
+        bool same = true;
+        for (std::uint32_t record = 0; record < records && same; ++record) {
+            std::uint32_t word = 0u;
+            if (!runtime.readWords(runtime.userContext, base + static_cast<std::uint64_t>(record) * column.stride + column.offset, &word, 1u)) same = false;
+            const auto format = (word >> 12u) & 0x7fu;
+            same = same && format != 0u && format <= static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float) && (record == 0u || format == agreed);
+            agreed = format;
+        }
+        if (same) snapshot.tableFormats[index] = agreed;
+        // Test: APS5_TEST_TABLE_FORMAT_BIAS=<n> reports a wrong format at every nth reading, as a table rewritten after
+        // the capture would, to exercise the shader's guard and the recovery at the next capture.
+        static const std::uint64_t bias = [] { const char* text = std::getenv("APS5_TEST_TABLE_FORMAT_BIAS"); return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; }();
+        static std::atomic<std::uint64_t> readings{0};
+        if (bias != 0u && same && readings.fetch_add(1, std::memory_order_relaxed) % bias == bias - 1u) snapshot.tableFormats[index] = agreed == 1u ? 2u : agreed - 1u;
+    }
 
     snapshot.images.resize(plan.info.images.size());
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
@@ -3145,6 +3174,12 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
     }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
+    // A table format column is read through these slots at capture, so a new table is a new capture.
+    for (const auto& column : plan.info.tableFormatColumns) {
+        for (const auto slot : column.tableSlots) {
+            if (slot < plan.pureFlatSlots.size()) plan.pureFlatSlots[slot] = 0u;
+        }
+    }
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     buildCompactPlan(plan);
     return plan;
