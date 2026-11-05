@@ -3677,6 +3677,7 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
                 }
                 const auto low = std::max(runBegin, sliceBegin) - sliceBegin;
                 const auto high = std::min(runEnd, sliceEnd) - sliceBegin;
+                if (low % block[0] != 0 || high % block[0] != 0) std::fprintf(stderr, "[gpu] unaligned storage window: image 0x%llx %ux%u format %u tile %u, level %u layer %u, slice +0x%llx+0x%llx, run +0x%llx..+0x%llx, block 0x%x, upload reason %s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), level, layer, static_cast<unsigned long long>(sliceBegin), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(runBegin), static_cast<unsigned long long>(runEnd), block[0], uploadReason != nullptr ? uploadReason : "none");
                 Require(low % block[0] == 0 && high % block[0] == 0, "storage image window is not tile-block aligned");
                 const auto firstBlock = low / block[0];
                 const auto lastBlock = (high - 1) / block[0];
