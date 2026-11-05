@@ -3646,7 +3646,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
     return runs;
 }
 
-std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
+std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool widenToBlocks) const {
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
@@ -3675,8 +3675,16 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
                     windows.push_back(std::move(window));
                     continue;
                 }
-                const auto low = std::max(runBegin, sliceBegin) - sliceBegin;
-                const auto high = std::min(runEnd, sliceEnd) - sliceBegin;
+                auto low = std::max(runBegin, sliceBegin) - sliceBegin;
+                auto high = std::min(runEnd, sliceEnd) - sliceBegin;
+                // A store retiles whole blocks into scratch and copies only the kept bytes out, and a small image's kept
+                // range ends at its last element, inside a block (C75: 0x5091300000, 128x120, +0xff00 aborted here).
+                if (widenToBlocks && (low % block[0] != 0 || high % block[0] != 0)) {
+                    static std::atomic<int> reported{0};
+                    if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] storage store window widened to blocks: image 0x%llx, run +0x%llx..+0x%llx, block 0x%x\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(runBegin), static_cast<unsigned long long>(runEnd), block[0]);
+                    low -= low % block[0];
+                    high = std::min<std::uint64_t>((high + block[0] - 1) / block[0] * block[0], mip.tiledSize);
+                }
                 if (low % block[0] != 0 || high % block[0] != 0) std::fprintf(stderr, "[gpu] unaligned storage window: image 0x%llx %ux%u format %u tile %u, level %u layer %u, slice +0x%llx+0x%llx, run +0x%llx..+0x%llx, block 0x%x, upload reason %s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), level, layer, static_cast<unsigned long long>(sliceBegin), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(runBegin), static_cast<unsigned long long>(runEnd), block[0], uploadReason != nullptr ? uploadReason : "none");
                 Require(low % block[0] == 0 && high % block[0] == 0, "storage image window is not tile-block aligned");
                 const auto firstBlock = low / block[0];
@@ -4029,7 +4037,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         storedBytes += to - from;
     }
     if (runs.empty()) return 0;
-    auto windows = sliceWindows(runs);
+    auto windows = sliceWindows(runs, true);
     // The linear rows and the tiled bytes of every window, each at a 256-byte position; the tail
     // levels of a layer retile into one scratch region (their block is shared).
     std::vector<std::uint64_t> linearPositions, scratchPositions;
