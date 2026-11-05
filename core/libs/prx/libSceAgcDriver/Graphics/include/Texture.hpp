@@ -41,6 +41,9 @@ void NoteProgramThreads(std::uint64_t program, std::uint32_t x, std::uint32_t y)
 std::pair<std::uint32_t, std::uint32_t> ProgramThreads(std::uint64_t program);
 bool DispatchCovers(std::uint32_t width, std::uint32_t height);
 void SetStorageOverwrite(bool overwrite);
+// Diagnostic ([target-upload], APS5_PROFILE_DRAW, every 10 s): the draw shape behind a colour target's lookup, to size
+// skipping uploads a draw would overwrite. Counts only; -1 outside a target lookup. Classes: see targetUploadNames.
+void SetTargetUploadClass(int uploadClass);
 
 class Buffer;
 class ResidentColor;

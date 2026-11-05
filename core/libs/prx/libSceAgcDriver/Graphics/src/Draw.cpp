@@ -29,6 +29,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <optional>
 #include <cstdio>
@@ -1941,6 +1942,21 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+// Diagnostic ([target-upload]): the first test a draw fails for overwriting colour target `index` whole, or 0 / 1 when it
+// passes them all (0: at most six vertices once, the shape of a full-screen pass). Coverage and pixel kill stay unproven.
+int classifyTargetUpload(const State& state, std::size_t index, const ColorTarget& color, const Pm4::DrawParameters& draw) {
+    const auto blend = index < state.blends.size() ? state.blends[index] : VkPipelineColorBlendAttachmentState{};
+    if (index >= state.blends.size() || blend.blendEnable == VK_TRUE) return 2;
+    constexpr VkColorComponentFlags all = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if ((blend.colorWriteMask & all) != all) return 3;
+    const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
+    const bool fullViewport = state.viewport.x <= 0.0f && std::min(state.viewport.y, state.viewport.y + state.viewport.height) <= 0.0f && state.viewport.width >= static_cast<float>(color.extent.width) && std::abs(state.viewport.height) >= static_cast<float>(color.extent.height);
+    if (!fullScissor || !fullViewport) return 4;
+    if (state.depthTest || state.stencilTest || state.depthBoundsTest) return 5;
+    if (state.alphaToCoverage) return 6;
+    return !draw.indirect && draw.indexCount <= 6u && draw.instanceCount <= 1u ? 0 : 1;
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
@@ -3181,6 +3197,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
+            if (profile) SetTargetUploadClass(classifyTargetUpload(state, index, color, draw));
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
@@ -3199,6 +3216,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
             });
+            if (profile) SetTargetUploadClass(-1);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);

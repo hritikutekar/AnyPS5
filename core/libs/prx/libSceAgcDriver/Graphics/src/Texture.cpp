@@ -129,6 +129,13 @@ thread_local const char* uploadReason = "first";
 thread_local int storageUse = 0;
 std::atomic<std::uint64_t> useUploads[5]{}, useUploadBytes[5]{}, useWriteBacks[5]{}, useWriteBackBytes[5]{};
 std::atomic<std::uint64_t> overwriteRefreshes{0}, overwriteUploadsSkipped{0}, overwriteUnitsDropped{0};
+// Diagnostic ([target-upload]): uploads made by a colour target's lookup, by the draw's shape (SetTargetUploadClass) and
+// upload reason. The first two classes pass every state test; neither proves coverage or the absence of pixel kill.
+constexpr std::size_t TargetUploadClasses = 7, TargetUploadReasons = 6;
+constexpr const char* targetUploadNames[TargetUploadClasses] = {"candidate small draw", "candidate geometry or indirect", "blended", "partial write mask", "partial scissor or viewport", "depth or stencil test", "alpha to coverage"};
+constexpr const char* targetUploadReasonNames[TargetUploadReasons] = {"store", "keys", "alias", "flushed", "shadow", "other"};
+thread_local int targetUploadClass = -1;
+std::atomic<std::uint64_t> targetUploads[TargetUploadClasses]{}, targetUploadBytes[TargetUploadClasses][TargetUploadReasons]{};
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -204,6 +211,26 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.lastReport = now;
     {
         static constexpr const char* useNames[5] = {"other", "storage write-only", "storage read", "render/depth target", "sampled"};
+        std::string targets = "[target-upload] (10 s) uploads by colour target lookups, by the draw's shape (count/MiB):";
+        for (std::size_t kind = 0; kind < TargetUploadClasses; ++kind) {
+            char entry[128];
+            std::snprintf(entry, sizeof(entry), " %s %llu/", targetUploadNames[kind], static_cast<unsigned long long>(targetUploads[kind].exchange(0)));
+            targets += entry;
+            std::uint64_t total = 0;
+            std::string reasons;
+            for (std::size_t reason = 0; reason < TargetUploadReasons; ++reason) {
+                const auto bytes = targetUploadBytes[kind][reason].exchange(0);
+                total += bytes;
+                if (bytes == 0) continue;
+                std::snprintf(entry, sizeof(entry), "%s %s %.0f", reasons.empty() ? "" : ",", targetUploadReasonNames[reason], bytes / 1048576.0);
+                reasons += entry;
+            }
+            std::snprintf(entry, sizeof(entry), "%.1f", total / 1048576.0);
+            targets += entry;
+            if (!reasons.empty()) targets += " (" + reasons + ")";
+            targets += ";";
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", targets.c_str());
         std::string uses = "[storage-use] (10 s) dead transitions: " + std::to_string(overwriteRefreshes.exchange(0)) + " overwrite refreshes, " + std::to_string(overwriteUploadsSkipped.exchange(0)) + " uploads skipped, " + std::to_string(overwriteUnitsDropped.exchange(0)) + " pending units dropped; storage uploads / write-backs by the binding use of the lookup that caused them:";
         char item[160];
         for (std::size_t use = 0; use < 5; ++use) {
@@ -268,6 +295,15 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes, const GuestTextur
     if (!LookupOutcomes::Profiled()) return;
     useUploads[storageUse].fetch_add(1, std::memory_order_relaxed);
     useUploadBytes[storageUse].fetch_add(bytes, std::memory_order_relaxed);
+    if (targetUploadClass >= 0) {
+        const char* why = uploadReason != nullptr ? uploadReason : "other";
+        std::size_t reason = TargetUploadReasons - 1;
+        for (std::size_t index = 0; index + 1 < TargetUploadReasons; ++index) {
+            if (std::strcmp(why, targetUploadReasonNames[index]) == 0) reason = index;
+        }
+        targetUploads[targetUploadClass].fetch_add(1, std::memory_order_relaxed);
+        targetUploadBytes[targetUploadClass][reason].fetch_add(bytes, std::memory_order_relaxed);
+    }
     if (storageUse == 0) noteOtherCaller(bytes, true);
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -2556,6 +2592,10 @@ bool DispatchCovers(std::uint32_t width, std::uint32_t height) {
 
 void SetStorageOverwrite(bool overwrite) {
     storageOverwrite = overwrite;
+}
+
+void SetTargetUploadClass(int uploadClass) {
+    targetUploadClass = uploadClass;
 }
 
 void SetStorageUse(int use) {
