@@ -6182,7 +6182,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::applyOverlaysAnd
 // space ranges between the spans are copied. The result is the same list. APS5_VERIFY_BDA_INCREMENTAL=1
 // compares every result with AddressRanges(); APS5_NO_INCREMENTAL_BDA_RANGES=1 (runtime switch) merges
 // in full.
-void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const {
+void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result, std::vector<ShaderRecompiler::BdaAbi::Span>* spans) const {
     Require(uploaded && !committed && space != nullptr, "incremental BDA ranges need the cached space");
     using Range = ShaderRecompiler::BdaAbi::Range;
     const std::span<const Range> spaceRanges(space->ranges);
@@ -6231,10 +6231,10 @@ void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::B
     std::uint64_t groupNs = 0;
     const auto assembleStart = std::chrono::steady_clock::now();
     result.clear();
-    result.reserve(spaceRanges.size() + edits.size() * 3u);
+    if (spans == nullptr) result.reserve(spaceRanges.size() + edits.size() * 3u);
     std::size_t copied = 0;
     for (const auto& group : groups) {
-        result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.begin() + static_cast<std::ptrdiff_t>(group.first));
+        if (spans == nullptr) result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.begin() + static_cast<std::ptrdiff_t>(group.first));
         const auto groupStart = std::chrono::steady_clock::now();
         std::vector<Range> own;
         std::vector<Range> overlays;
@@ -6254,7 +6254,9 @@ void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::B
         groupNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - groupStart).count());
         result.insert(result.end(), part.begin(), part.end());
         copied = group.last;
+        if (spans != nullptr) spans->push_back({slice.empty() ? group.begin : std::min(group.begin, slice.front().begin), slice.empty() ? group.end : std::max(group.end, slice.back().end)});
     }
+    if (spans != nullptr) return;
     result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.end());
     {
         const auto totalNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - assembleStart).count());
@@ -6266,6 +6268,49 @@ void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::B
         const auto full = AddressRanges();
         Require(full.size() == result.size() && (full.empty() || std::memcmp(full.data(), result.data(), full.size() * sizeof(Range)) == 0), "the incremental BDA ranges differ from AddressRanges()");
     }
+}
+
+std::optional<GuestBufferMemory::TableEdits> GuestBufferMemory::AddressTableEdits() const {
+    if (space == nullptr) return std::nullopt;
+    Require(uploaded && !committed, "guest GPU address ranges are not available");
+    TableEdits edits;
+    edits.serial = space->serial;
+    edits.base = &space->ranges;
+    if (writes.empty() && regions.empty()) return edits;
+    const auto& spaceRanges = space->ranges;
+    const bool inWritable = regions.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
+        auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
+        for (; at != spaceRanges.end() && at->begin < written.second; ++at) {
+            if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0u) return false;
+        }
+        return true;
+    });
+    if (inWritable) {
+        addressTableTimes().quick.fetch_add(1, std::memory_order_relaxed);
+        return edits;
+    }
+    incrementalAddressRanges(edits.parts, &edits.spans);
+    static const bool verify = std::getenv("APS5_VERIFY_BDA_TWO_LEVEL") != nullptr;
+    if (verify) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> merged;
+        auto part = edits.parts.begin();
+        std::size_t span = 0;
+        for (const auto& range : spaceRanges) {
+            while (span < edits.spans.size() && edits.spans[span].end <= range.begin) {
+                while (part != edits.parts.end() && part->begin < edits.spans[span].end) merged.push_back(*part++);
+                ++span;
+            }
+            if (span < edits.spans.size() && range.begin < edits.spans[span].end && edits.spans[span].begin < range.end) continue;
+            merged.push_back(range);
+        }
+        for (; span < edits.spans.size(); ++span) {
+            while (part != edits.parts.end() && part->begin < edits.spans[span].end) merged.push_back(*part++);
+        }
+        std::stable_sort(merged.begin(), merged.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        const auto full = AddressRanges();
+        Require(part == edits.parts.end() && full.size() == merged.size() && (full.empty() || std::memcmp(full.data(), merged.data(), full.size() * sizeof(full.front())) == 0), "the two-level BDA table differs from the merged one");
+    }
+    return edits;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {

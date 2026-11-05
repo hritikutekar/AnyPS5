@@ -366,6 +366,16 @@ public:
         std::uint64_t keyHash = 0;
     };
     std::optional<CachedTable> CachedAddressTable() const;
+    // A build's table in two levels (BdaAbi::Root): the cached space's ranges (shared by its builds), and this build's
+    // parts and the spans they replace, ascending and disjoint. No value without a cached space. Spans empty: the base
+    // serves the build. APS5_VERIFY_BDA_TWO_LEVEL=1 compares base + spans + parts with AddressRanges().
+    struct TableEdits {
+        std::uint64_t serial = 0;
+        const std::vector<ShaderRecompiler::BdaAbi::Range>* base = nullptr;
+        std::vector<ShaderRecompiler::BdaAbi::Range> parts;
+        std::vector<ShaderRecompiler::BdaAbi::Span> spans;
+    };
+    std::optional<TableEdits> AddressTableEdits() const;
     // The registered memory an address-based build maps, shared by consecutive builds (see
     // GuestBufferMemory.cpp): its lease and the sorted, immutable regions of the ranges served in
     // place by imports and mirrors. Opaque outside GuestBufferMemory.cpp.
@@ -526,7 +536,8 @@ private:
     std::vector<ShaderRecompiler::BdaAbi::Range> applyOverlaysAndWrites(std::vector<ShaderRecompiler::BdaAbi::Range> result, std::vector<ShaderRecompiler::BdaAbi::Range> overlays, std::span<const std::pair<std::uint64_t, std::uint64_t>> writtenRanges) const;
     // AddressRanges() for a build over the cached space, redoing only the neighbourhood of its own
     // regions, overlays and writes (see GuestBufferMemory.cpp).
-    void incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const;
+    // With `spans`, `result` gets the ranges of the edited spans only.
+    void incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result, std::vector<ShaderRecompiler::BdaAbi::Span>* spans = nullptr) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {

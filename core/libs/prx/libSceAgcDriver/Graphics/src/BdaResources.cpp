@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,8 @@ struct TableCache {
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     BdaResources::TableCacheStats classes;
+    // The shared root of each base table a build without edits binds (see BdaAbi::Root).
+    std::map<const Buffer*, std::weak_ptr<Buffer>> roots;
 };
 
 bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right);
@@ -216,9 +219,13 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     // chain, as before (see hashRangesLanes and GuestBufferMemory's range-list pool).
     const bool lean = !RuntimeSwitches::Set(RuntimeSwitch::NoLeanBdaTables);
     const auto rangesStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto cached = memory.CachedAddressTable();
+    static const bool twoLevel = std::getenv("APS5_NO_TWO_LEVEL_BDA") == nullptr;
+    std::optional<GuestBufferMemory::TableEdits> edits;
+    if (twoLevel) edits = memory.AddressTableEdits();
+    const auto cached = !twoLevel ? memory.CachedAddressTable() : edits.has_value() ? std::optional<GuestBufferMemory::CachedTable>(GuestBufferMemory::CachedTable{edits->serial, edits->base, nullptr}) : std::nullopt;
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
+    const auto bindBase = [&] {
     const auto tableStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) {
         bdaBuildTimes().ranges.fetch_add(1, std::memory_order_relaxed);
@@ -345,7 +352,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto bufferStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (twoLevel ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
     const auto copyStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
@@ -372,6 +379,50 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         cache.entries.push_front({hash, std::move(entryRanges), table, serial, tableBytes});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
+    };
+    bindBase();
+    if (!twoLevel) return;
+    using Root = ShaderRecompiler::BdaAbi::Root;
+    using Span = ShaderRecompiler::BdaAbi::Span;
+    using Header = ShaderRecompiler::BdaAbi::Header;
+    using Range = ShaderRecompiler::BdaAbi::Range;
+    const bool plain = !edits.has_value() || edits->spans.empty();
+    if (plain) {
+        // Every build of a space without edits shares one root.
+        auto& roots = Tables();
+        std::lock_guard lock(roots.mutex);
+        if (const auto found = roots.roots.find(table.get()); found != roots.roots.end()) {
+            root = found->second.lock();
+            if (root != nullptr) {
+                rootBytes = sizeof(Root) + sizeof(Header);
+                return;
+            }
+        }
+    }
+    const auto spanCount = plain ? std::size_t{0} : edits->spans.size();
+    const auto partCount = plain ? std::size_t{0} : edits->parts.size();
+    if (!plain) {
+        Require(ShaderRecompiler::BdaAbi::RangesOrdered(edits->parts.data(), partCount), "BDA parts do not ascend by begin");
+        for (const auto& range : edits->parts) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA part lies past the written-page keys");
+    }
+    const auto partsAt = sizeof(Root) + spanCount * sizeof(Span);
+    const auto partsBytes = sizeof(Header) + partCount * sizeof(Range);
+    rootBytes = partsAt + partsBytes;
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
+    root = std::make_shared<Buffer>(context, rootBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    const Root head{{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(spanCount), sizeof(Span), ShaderRecompiler::BdaAbi::RootTable}, table->DeviceAddress(), root->DeviceAddress() + partsAt, static_cast<std::uint32_t>(tableBytes / sizeof(std::uint32_t)), static_cast<std::uint32_t>(partsBytes / sizeof(std::uint32_t)), 0u};
+    auto* bytes = root->Bytes().data();
+    std::memcpy(bytes, &head, sizeof(head));
+    const Header partsHeader{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(partCount), sizeof(Range), 0u};
+    std::memcpy(bytes + partsAt, &partsHeader, sizeof(partsHeader));
+    if (spanCount != 0u) std::memcpy(bytes + sizeof(Root), edits->spans.data(), spanCount * sizeof(Span));
+    if (partCount != 0u) std::memcpy(bytes + partsAt + sizeof(Header), edits->parts.data(), partCount * sizeof(Range));
+    if (plain) {
+        auto& roots = Tables();
+        std::lock_guard lock(roots.mutex);
+        if (roots.roots.size() >= 64u) std::erase_if(roots.roots, [](const auto& entry) { return entry.second.expired(); });
+        roots.roots[table.get()] = root;
+    }
 }
 
 BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
@@ -386,6 +437,7 @@ BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
 
 VkDescriptorBufferInfo BdaResources::Table() const {
     Require(table != nullptr, "BDA page table was not requested");
+    if (root != nullptr) return {root->Handle(), 0, rootBytes};
     return {table->Handle(), 0, tableBytes};
 }
 

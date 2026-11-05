@@ -59,6 +59,9 @@ private:
     void markWrittenPages() const;
     void checkSrtGuard() const;
     std::shared_ptr<Buffer> table;
+    // Two-level tables (BdaAbi::Root): what the shader binds; `table` is then the base it points to.
+    std::shared_ptr<Buffer> root;
+    std::size_t rootBytes = 0;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
     std::vector<ImageTableFaults> imageTables;

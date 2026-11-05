@@ -64,16 +64,81 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         }
         leaveIf(binary(spv::OpINotEqual, boolean, reason, constant(0u)), reason);
     };
-    const auto length = state.module.AllocateId();
-    state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+    // Two-level tables: the root's spans pick the table to search, read through its device address; the search below is
+    // the same for both (BdaAbi::Root).
+    const bool twoLevel = BdaAbi::TwoLevelTables();
+    std::uint32_t tableAddress = 0u;
+    std::uint32_t tableWords = 0u;
+    if (twoLevel) {
+        constexpr auto rootWords = static_cast<std::uint32_t>(sizeof(BdaAbi::Root) / sizeof(std::uint32_t));
+        constexpr auto spanWords = static_cast<std::uint32_t>(sizeof(BdaAbi::Span) / sizeof(std::uint32_t));
+        const auto rootLength = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, rootLength, state.bdaPagetableVariable, 0u);
+        fail(binary(spv::OpULessThan, boolean, rootLength, constant(rootWords)), BdaAbi::FaultReason::InvalidTable);
+        const auto spans = BdaLoadWord(state, constant(1));
+        failFirst({
+            {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(BdaAbi::RootTable)), BdaAbi::FaultReason::InvalidTable},
+            {binary(spv::OpUGreaterThan, boolean, binary(spv::OpIAdd, u32, constant(rootWords), binary(spv::OpIMul, u32, spans, constant(spanWords))), rootLength), BdaAbi::FaultReason::InvalidTable},
+        });
+        const auto spanEntry = state.currentLabel;
+        const auto spanHeader = state.module.AllocateId();
+        const auto spanBody = state.module.AllocateId();
+        const auto spanContinue = state.module.AllocateId();
+        const auto spanMerge = state.module.AllocateId();
+        const auto spanIndex = state.module.AllocateId();
+        const auto spanHit = state.module.AllocateId();
+        const auto nextIndex = state.module.AllocateId();
+        const auto nextHit = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBranch, spanHeader);
+        EmitLabel(state, spanHeader);
+        state.module.AddFunction(spv::OpPhi, u32, spanIndex, constant(0u), spanEntry, nextIndex, spanContinue);
+        state.module.AddFunction(spv::OpPhi, boolean, spanHit, ConstantBool(state, false), spanEntry, nextHit, spanContinue);
+        const auto scanning = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, spanIndex, spans), Unary(state, spv::OpLogicalNot, boolean, spanHit));
+        state.module.AddFunction(spv::OpLoopMerge, spanMerge, spanContinue, spv::LoopControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, scanning, spanBody, spanMerge);
+        EmitLabel(state, spanBody);
+        const auto spanAt = binary(spv::OpIAdd, u32, constant(rootWords), binary(spv::OpIMul, u32, spanIndex, constant(spanWords)));
+        const auto spanBegin = BdaLoadAddress(state, spanAt);
+        const auto spanEnd = BdaLoadAddress(state, binary(spv::OpIAdd, u32, spanAt, constant(2u)));
+        const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, spanBegin), binary(spv::OpULessThan, boolean, address, spanEnd));
+        state.module.AddFunction(spv::OpBranch, spanContinue);
+        EmitLabel(state, spanContinue);
+        state.module.AddFunction(spv::OpIAdd, u32, nextIndex, spanIndex, constant(1u));
+        state.module.AddFunction(spv::OpCopyObject, boolean, nextHit, inside);
+        state.module.AddFunction(spv::OpBranch, spanHeader);
+        EmitLabel(state, spanMerge);
+        tableAddress = Select(state, u64, spanHit, BdaLoadAddress(state, constant(6u)), BdaLoadAddress(state, constant(4u)));
+        tableWords = Select(state, u32, spanHit, BdaLoadWord(state, constant(9u)), BdaLoadWord(state, constant(8u)));
+    }
+    const auto word = [&](std::uint32_t index) {
+        if (!twoLevel) return BdaLoadWord(state, index);
+        const auto at = binary(spv::OpIAdd, u64, tableAddress, binary(spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, index), BdaConstant(state, 2u)));
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, u32), pointer, at);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer, spv::MemoryAccessAlignedMask, 4u);
+        return value;
+    };
+    const auto addressWord = [&](std::uint32_t index) {
+        if (!twoLevel) return BdaLoadAddress(state, index);
+        const auto low = Unary(state, spv::OpUConvert, u64, word(index));
+        const auto high = Unary(state, spv::OpUConvert, u64, word(binary(spv::OpIAdd, u32, index, constant(1u))));
+        return binary(spv::OpBitwiseOr, u64, low, binary(spv::OpShiftLeftLogical, u64, high, BdaConstant(state, 32u)));
+    };
+    auto length = tableWords;
+    if (!twoLevel) {
+        length = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+    }
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
-    const auto count = BdaLoadWord(state, constant(1));
+    const auto count = word(constant(1));
     const auto available = binary(spv::OpISub, u32, length, constant(4));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     // A plain table is exactly its ranges; an indexed one (BdaAbi::IndexedTable) has its index
     // header and `buckets + 1` start words after them. Every index word read here and below stays
     // inside the table whatever it holds (the reads of a table that fails a check go to word 0).
-    const auto reserved = BdaLoadWord(state, constant(3));
+    const auto reserved = word(constant(3));
     const auto indexed = binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable));
     const auto countFits = binary(spv::OpULessThanEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3)));
     const auto rangeWords = binary(spv::OpIMul, u32, Select(state, u32, countFits, count, constant(0)), constant(8));
@@ -81,14 +146,14 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     constexpr auto indexHeaderWords = static_cast<std::uint32_t>(sizeof(BdaAbi::IndexHeader) / sizeof(std::uint32_t));
     const auto headerFits = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, indexed, countFits), binary(spv::OpUGreaterThanEqual, boolean, indexWords, constant(indexHeaderWords + 1u)));
     const auto indexAt = Select(state, u32, headerFits, binary(spv::OpIAdd, u32, constant(4), rangeWords), constant(0));
-    const auto indexBase = BdaLoadAddress(state, indexAt);
-    const auto buckets = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(2)));
-    const auto shift = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(3)));
+    const auto indexBase = addressWord(indexAt);
+    const auto buckets = word(binary(spv::OpIAdd, u32, indexAt, constant(2)));
+    const auto shift = word(binary(spv::OpIAdd, u32, indexAt, constant(3)));
     const auto plainBad = binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
     const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, indexWords, constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
     failFirst({
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpINotEqual, boolean, word(constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpINotEqual, boolean, word(constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, reserved, constant(0)), Unary(state, spv::OpLogicalNot, boolean, indexed)), BdaAbi::FaultReason::InvalidTable},
         {Select(state, boolean, indexed, indexBad, plainBad), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
@@ -102,9 +167,9 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto inBucket = binary(spv::OpLogicalAnd, boolean, indexed, Unary(state, spv::OpLogicalNot, boolean, binary(spv::OpLogicalOr, boolean, below, beyond)));
     const auto startAt = Select(state, u32, inBucket, binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, indexAt, constant(indexHeaderWords)), Unary(state, spv::OpUConvert, u32, bucket)), constant(0));
     const auto outside = Select(state, u32, below, constant(0), count);
-    const auto startHigh = Select(state, u32, indexed, Select(state, u32, inBucket, BdaLoadWord(state, binary(spv::OpIAdd, u32, startAt, constant(1))), outside), count);
+    const auto startHigh = Select(state, u32, indexed, Select(state, u32, inBucket, word(binary(spv::OpIAdd, u32, startAt, constant(1))), outside), count);
     const auto searchHigh = Select(state, u32, binary(spv::OpULessThan, boolean, count, startHigh), count, startHigh);
-    const auto startLow = Select(state, u32, indexed, Select(state, u32, inBucket, BdaLoadWord(state, startAt), outside), constant(0));
+    const auto startLow = Select(state, u32, indexed, Select(state, u32, inBucket, word(startAt), outside), constant(0));
     const auto searchLow = Select(state, u32, binary(spv::OpULessThan, boolean, searchHigh, startLow), searchHigh, startLow);
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
@@ -125,7 +190,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     EmitLabel(state, body);
     const auto midpoint = binary(spv::OpIAdd, u32, lower, binary(spv::OpShiftRightLogical, u32, binary(spv::OpISub, u32, upper, lower), constant(1)));
     const auto entry = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, midpoint, constant(8)));
-    const auto before = binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, entry));
+    const auto before = binary(spv::OpULessThan, boolean, address, addressWord(entry));
     state.module.AddFunction(spv::OpSelect, u32, newLow, before, lower, binary(spv::OpIAdd, u32, midpoint, constant(1)));
     state.module.AddFunction(spv::OpSelect, u32, newHigh, before, midpoint, upper);
     state.module.AddFunction(spv::OpBranch, continuation);
@@ -136,15 +201,15 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
     const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
-    const auto begin = BdaLoadAddress(state, selected);
-    const auto finish = BdaLoadAddress(state, at(2));
-    const auto base = BdaLoadAddress(state, at(4));
-    const auto permissions = BdaLoadWord(state, at(6));
+    const auto begin = addressWord(selected);
+    const auto finish = addressWord(at(2));
+    const auto base = addressWord(at(4));
+    const auto permissions = word(at(6));
     const auto offset = binary(spv::OpISub, u64, address, begin);
     const auto result = binary(spv::OpIAdd, u64, base, offset);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     failFirst({
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpINotEqual, boolean, word(at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped},
         {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission},
@@ -154,7 +219,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     });
     if (rangeResult) {
         const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
-        const auto next = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));
+        const auto next = addressWord(binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));
         const auto bound = Select(state, u64, binary(spv::OpLogicalOr, boolean, last, binary(spv::OpULessThan, boolean, finish, next)), finish, next);
         const auto range = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, begin, bound, base);

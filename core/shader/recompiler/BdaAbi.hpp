@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -43,6 +44,29 @@ struct IndexHeader {
     std::uint32_t buckets;
     std::uint32_t shift;
 };
+// Two-level tables (APS5_NO_TWO_LEVEL_BDA=1 binds the merged table of a build instead): the binding holds a small root
+// whose Header::reserved is RootTable and Header::count the number of Spans after it. An address inside a span is
+// looked up in the build's parts (a plain table in the root's buffer), any other in the space's base table, shared
+// by every build of the space and reached by device address. A span replaces the base ranges it covers whole, so the
+// lookup answers as the merged table would.
+inline constexpr std::uint32_t RootTable = 2;
+struct Root {
+    Header header;
+    std::uint64_t base;
+    std::uint64_t parts;
+    std::uint32_t baseWords;
+    std::uint32_t partsWords;
+    std::uint64_t reserved;
+};
+struct Span {
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+inline bool TwoLevelTables() {
+    static const bool enabled = std::getenv("APS5_NO_TWO_LEVEL_BDA") == nullptr;
+    return enabled;
+}
+
 inline constexpr std::uint32_t IndexMinRanges = 16;
 inline constexpr std::uint64_t IndexMaxBuckets = std::uint64_t{1} << 16u;
 
@@ -110,6 +134,7 @@ static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<R
 static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
 static_assert(std::is_standard_layout_v<IndexHeader> && sizeof(IndexHeader) == 16 && offsetof(IndexHeader, buckets) == 8 && offsetof(IndexHeader, shift) == 12);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
+static_assert(std::is_standard_layout_v<Root> && sizeof(Root) == 48 && offsetof(Root, base) == 16 && offsetof(Root, parts) == 24 && offsetof(Root, baseWords) == 32 && sizeof(Span) == 16);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24 && offsetof(Fault, otherFaults) == 28);
 
 inline constexpr std::uint32_t WrittenPageShift = 12;
