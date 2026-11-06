@@ -15,6 +15,7 @@ struct FloatFlushProbeResult {
 };
 
 FloatFlushProbeResult ProbeFloat32FlushToZero(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
+void LogHardwareFloatProbe(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target);
 
 }
 

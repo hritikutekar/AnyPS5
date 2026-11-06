@@ -2371,6 +2371,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->float32FlushToZero = probe.mismatches == 0u;
         std::fprintf(stderr, "[float-controls] f32 denormal flush: %s (%u of %u probe results differ from the emulated flush, %.0f ms)\n", state->float32FlushToZero ? "hardware" : "emulated", probe.mismatches, probe.compared, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - probeStart).count());
     }
+    if (std::getenv("APS5_PROBE_HARDWARE_FLOAT") != nullptr) {
+        state->probingFloatControls = true;
+        LogHardwareFloatProbe(*this, Target());
+        state->probingFloatControls = false;
+    }
     // A device without a window is usually replaced by the window's device before the title draws
     // (Driver::AttachWindow): its replay starts at its first draw or dispatch instead, so the
     // journal is replayed once, on the device the title draws with.

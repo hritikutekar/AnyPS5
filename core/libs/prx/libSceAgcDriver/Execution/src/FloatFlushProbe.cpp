@@ -3,6 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <vector>
@@ -164,7 +168,111 @@ std::vector<std::uint32_t> Run(VulkanDevice& device, ShaderRecompiler::SpirvTarg
     return {Output.begin(), Output.end()};
 }
 
+
+// APS5_PROBE_HARDWARE_FLOAT=1: one program runs rcp, rsq, sqrt, log, exp, fract, floor, ceil, trunc, rndne, sin, cos,
+// med3, output modifiers, add, mul and fma on specials and random operands, with the exact forms and with
+// SpirvTarget::hardwareNanResults/hardwareFloatOps; the differences are logged by operation and kind.
+alignas(256) std::array<std::uint32_t, 41> HardwareFloatCode{};
+alignas(256) std::uint32_t HardwareFloatRows[Threads][Inputs]{};
+constexpr std::array<const char*, Results> HardwareFloatNames{"rcp", "rsq", "sqrt", "log", "exp", "fract", "floor", "ceil", "trunc", "rndne", "sin", "cos", "med3", "omod*2", "omod*4", "omod/2", "add", "mul", "fma"};
+
+void BuildHardwareFloatCode() {
+    std::size_t at = 0;
+    for (std::size_t index = 0; index < 6; ++index) HardwareFloatCode[at++] = MixedCode[index];
+    std::uint32_t destination = 10;
+    for (const std::uint32_t opcode : {0x2au, 0x2eu, 0x33u, 0x27u, 0x25u, 0x20u, 0x24u, 0x22u, 0x21u, 0x23u, 0x35u, 0x36u}) HardwareFloatCode[at++] = 0x7e000000u | destination++ << 17u | opcode << 9u | 0x104u;
+    HardwareFloatCode[at++] = 0xd5570000u | destination++;
+    HardwareFloatCode[at++] = 0x041a0b04u;
+    for (const std::uint32_t omod : {1u, 2u, 3u}) {
+        HardwareFloatCode[at++] = 0xd5080000u | destination++;
+        HardwareFloatCode[at++] = 0x00000b04u | omod << 27u;
+    }
+    HardwareFloatCode[at++] = 0x06000b04u | destination++ << 17u;
+    HardwareFloatCode[at++] = 0x10000b04u | destination++ << 17u;
+    HardwareFloatCode[at++] = 0xd54b0000u | destination++;
+    HardwareFloatCode[at++] = 0x041a0b04u;
+    for (std::size_t index = 35; index < MixedCode.size(); ++index) HardwareFloatCode[at++] = MixedCode[index];
 }
+
+void FillHardwareFloatRows(std::uint32_t batch, std::uint64_t& random) {
+    constexpr std::array<std::uint32_t, 40> Specials{
+        0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f812345u, 0xff812345u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u, 0x00800001u,
+        0x3f800000u, 0xbf800000u, 0x3f7fffffu, 0x3f800001u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0xbe800000u, 0xbf000000u, 0x40000000u, 0x40800000u, 0x1e3ce508u, 0x60ad78ecu, 0x7f7fffffu, 0xff7fffffu, 0x42fe0000u,
+        0xc2fc0000u, 0xc3000000u, 0x43000000u, 0x4b000000u, 0x4b7fffffu, 0x3fc00000u, 0xbfc00000u, 0x2f800000u};
+    const auto next = [&] {
+        random = random * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<std::uint32_t>(random >> 32u);
+    };
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        for (std::uint32_t input = 0; input < Inputs; ++input) {
+            std::uint32_t value = next();
+            if (batch < 16u) value = Specials[value % Specials.size()];
+            else if (batch % 2u == 0u) value = (value & 0x807fffffu) | (107u + (value >> 23u & 0xffu) * 40u / 256u) << 23u;
+            HardwareFloatRows[tid][input] = value;
+        }
+    }
+}
+
+std::int64_t Ordered(std::uint32_t bits) {
+    return (bits & 0x80000000u) != 0u ? -static_cast<std::int64_t>(bits & 0x7fffffffu) : static_cast<std::int64_t>(bits);
+}
+
+float AsFloat(std::uint32_t bits) {
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+}
+
+void LogHardwareFloatProbe(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    struct Kind { std::uint64_t compared = 0, same = 0, payload = 0, zeroSign = 0, nearby = 0, nanness = 0, far = 0; std::int64_t worstUlp = 0; float worstAbsolute = 0.0f; std::uint32_t exact = 0, hardware = 0, a = 0, b = 0, c = 0; };
+    BuildHardwareFloatCode();
+    auto exact = target;
+    exact.hardwareNanResults = false;
+    exact.hardwareFloatOps = false;
+    auto native = target;
+    native.hardwareNanResults = true;
+    native.hardwareFloatOps = true;
+    const std::array<std::optional<ShaderRecompiler::ShaderFloatMode>, 3> modes{std::nullopt, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}};
+    for (std::size_t mode = 0; mode < modes.size(); ++mode) {
+        std::array<Kind, Results> kinds{};
+        std::uint64_t random = 0x1234567u + mode;
+        for (std::uint32_t batch = 0; batch < 64u; ++batch) {
+            FillHardwareFloatRows(batch, random);
+            const auto reference = Run(device, exact, target.float32FlushToZero, modes[mode], HardwareFloatCode, HardwareFloatRows);
+            const auto result = Run(device, native, target.float32FlushToZero, modes[mode], HardwareFloatCode, HardwareFloatRows);
+            for (std::size_t index = 0; index < reference.size(); ++index) {
+                auto& kind = kinds[index % Results];
+                const auto left = reference[index];
+                const auto right = result[index];
+                ++kind.compared;
+                if (left == right) { ++kind.same; continue; }
+                if (IsNan(left) && IsNan(right)) { ++kind.payload; continue; }
+                if ((left & 0x7fffffffu) == 0u && (right & 0x7fffffffu) == 0u) { ++kind.zeroSign; continue; }
+                if (IsNan(left) != IsNan(right)) ++kind.nanness;
+                const auto ulp = std::llabs(Ordered(left) - Ordered(right));
+                if (!IsNan(left) && !IsNan(right) && ulp <= 16) ++kind.nearby;
+                else if (!IsNan(left) && !IsNan(right)) ++kind.far;
+                if (ulp > kind.worstUlp) {
+                    const auto* row = HardwareFloatRows[index / Results];
+                    kind.worstUlp = ulp;
+                    kind.exact = left;
+                    kind.hardware = right;
+                    kind.a = row[0];
+                    kind.b = row[1];
+                    kind.c = row[2];
+                }
+                if (!IsNan(left) && !IsNan(right)) kind.worstAbsolute = std::max(kind.worstAbsolute, std::fabs(AsFloat(left) - AsFloat(right)));
+            }
+        }
+        for (std::size_t index = 0; index < Results; ++index) {
+            const auto& kind = kinds[index];
+            std::fprintf(stderr, "[hw-float-probe] mode %zu %-7s compared %llu same %llu payload-only %llu zero-sign %llu within-16-ulp %llu far %llu nan-vs-number %llu; worst ulp %lld abs %g (exact %08x hardware %08x for %08x %08x %08x)\n", mode, HardwareFloatNames[index], static_cast<unsigned long long>(kind.compared), static_cast<unsigned long long>(kind.same), static_cast<unsigned long long>(kind.payload), static_cast<unsigned long long>(kind.zeroSign), static_cast<unsigned long long>(kind.nearby), static_cast<unsigned long long>(kind.far), static_cast<unsigned long long>(kind.nanness), static_cast<long long>(kind.worstUlp), static_cast<double>(kind.worstAbsolute), kind.exact, kind.hardware, kind.a, kind.b, kind.c);
+        }
+    }
+}
+
 
 FloatFlushProbeResult ProbeFloat32FlushToZero(VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
     FloatFlushProbeResult result;
