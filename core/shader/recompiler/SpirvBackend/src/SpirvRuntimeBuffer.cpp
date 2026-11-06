@@ -1033,12 +1033,47 @@ std::uint32_t rawGpuCall(SpirvValueEmitContext& context, const IrValue& instruct
         if (stops) state.bdaStopValue = state.module.Constant(spv::OpConstantComposite, resultType, zero, ConstantU32(state, 1u));
         state.bdaPcOverride = parameters[9];
         const RuntimeDescriptor shared{parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6], parameters[7], parameters[8]};
-        std::array<std::uint32_t, 4> values{};
-        for (std::uint32_t component = 0; component < components; ++component) {
-            const auto access = address(context, instruction, shared, component * 4u, 4u);
-            values[component] = EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readBuffer(context, instruction, access.guest, 32u); });
+        // The partial or swizzled case of a load, reached rarely but inlined at each load: one read in a loop, not one
+        // per component (they were a quarter of the top world programs). APS5_NO_RAW_LOAD_LOOP=1 unrolls it here.
+        static const bool loop = std::getenv("APS5_NO_RAW_LOAD_LOOP") == nullptr;
+        std::uint32_t returned = 0u;
+        if (loop && components > 2u) {
+            const auto entry = state.currentLabel;
+            const auto header = state.module.AllocateId();
+            const auto body = state.module.AllocateId();
+            const auto continuation = state.module.AllocateId();
+            const auto merge = state.module.AllocateId();
+            const auto component = state.module.AllocateId();
+            const auto gathered = state.module.AllocateId();
+            const auto nextComponent = state.module.AllocateId();
+            const auto nextGathered = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, header);
+            state.module.AddFunction(spv::OpPhi, u32, component, ConstantU32(state, 0u), entry, nextComponent, continuation);
+            state.module.AddFunction(spv::OpPhi, valueType, gathered, zero, entry, nextGathered, continuation);
+            const auto more = Binary(state, spv::OpULessThan, boolean, component, ConstantU32(state, components));
+            state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlDontUnrollMask);
+            state.module.AddFunction(spv::OpBranchConditional, more, body, merge);
+            EmitLabel(state, body);
+            auto each = shared;
+            each.offset = Binary(state, spv::OpIAdd, u32, shared.offset, Binary(state, spv::OpShiftLeftLogical, u32, component, ConstantU32(state, 2u)));
+            const auto access = address(context, instruction, each, 0u, 4u);
+            const auto value = EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readBuffer(context, instruction, access.guest, 32u); });
+            state.module.AddFunction(spv::OpVectorInsertDynamic, valueType, nextGathered, gathered, value, component);
+            state.module.AddFunction(spv::OpBranch, continuation);
+            EmitLabel(state, continuation);
+            state.module.AddFunction(spv::OpIAdd, u32, nextComponent, component, ConstantU32(state, 1u));
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, merge);
+            returned = gathered;
+        } else {
+            std::array<std::uint32_t, 4> values{};
+            for (std::uint32_t component = 0; component < components; ++component) {
+                const auto access = address(context, instruction, shared, component * 4u, 4u);
+                values[component] = EmitValueOrZeroIfCondition(state, access.inBounds, [&] { return readBuffer(context, instruction, access.guest, 32u); });
+            }
+            returned = composite(state, components, values);
         }
-        auto returned = composite(state, components, values);
         if (stops) {
             const auto value = returned;
             returned = state.module.AllocateId();
