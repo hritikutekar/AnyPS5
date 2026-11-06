@@ -202,6 +202,9 @@ public:
 private:
     void acquired();
     std::recursive_mutex mutex;
+    // Held with `mutex` by every outermost hold, always taken after it: what the mutex protects splits into resources
+    // (`mutex`) and recording (this), so a draw's recording can later run apart from resolving the next draw.
+    std::mutex recordMutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};

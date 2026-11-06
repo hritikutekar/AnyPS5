@@ -2600,7 +2600,10 @@ std::atomic<std::uint64_t> gpuHoldSerial{0};
 
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) {
+        recordMutex.lock();
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 bool GpuMutexType::try_lock() {
@@ -2641,6 +2644,7 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        recordMutex.unlock();
     }
     mutex.unlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
