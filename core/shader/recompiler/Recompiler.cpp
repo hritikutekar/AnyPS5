@@ -246,6 +246,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.interpolationFunctions = supports(spv::CapabilityInterpolationFunction);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.float32FlushToZero = request.target.float32FlushToZero;
+    translateOptions.hardwareNanResults = request.target.hardwareNanResults;
     translateOptions.inputInfo = inputInfo;
     if (stageKind == ShaderStageKind::Vertex && request.context.vertex.has_value()) {
         translateOptions.drawBaseVertexSgpr = request.context.vertex->drawBaseVertexSgpr;

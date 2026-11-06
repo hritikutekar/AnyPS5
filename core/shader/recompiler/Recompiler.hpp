@@ -330,6 +330,10 @@ struct SpirvTarget {
     // exact under SignedZeroInfNanPreserve 32, which the device requires (an AMD host: the driver sets it,
     // APS5_NO_NATIVE_ISNAN=1 clears it).
     bool nativeF32IsNan = false;
+    // f32 add/sub/mul/fma keep the device's NaN result (TranslationContext::nanResultF32 emits nothing). Any NaN
+    // source or invalid operation gives NaN either way; only which NaN encoding comes out can differ, so this
+    // is for AMD hosts, where the rest of the arithmetic matches the guest's (APS5_NO_HARDWARE_NAN=1 off).
+    bool hardwareNanResults = false;
     // Storage images that only load and store texels get heap cases: with the HeapImageMode selector the driver binds
     // no image and the shader reads and writes the T#'s tiled guest bytes through the BDA page table
     // (PipelineSpecialization::HeapImageMode; the driver sets it, APS5_NO_HEAP_STORAGE=1 clears it).
