@@ -48,15 +48,21 @@ struct IndexHeader {
 // whose Header::reserved is RootTable and Header::count the number of Spans after it. An address inside a span is
 // looked up in the build's parts (a plain table in the root's buffer), any other in the space's base table, shared
 // by every build of the space and reached by device address. A span replaces the base ranges it covers whole, so the
-// lookup answers as the merged table would.
+// lookup answers as the merged table would. The root repeats each table's header fields: read from the binding they
+// are uniform scalar loads, where reading them from a table picked per lane costs a chain of vector loads per lookup.
 inline constexpr std::uint32_t RootTable = 2;
+struct RootTableFields {
+    std::uint64_t address;
+    std::uint64_t indexBase;
+    std::uint32_t count;
+    std::uint32_t reserved;
+    std::uint32_t buckets;
+    std::uint32_t shift;
+};
 struct Root {
     Header header;
-    std::uint64_t base;
-    std::uint64_t parts;
-    std::uint32_t baseWords;
-    std::uint32_t partsWords;
-    std::uint64_t reserved;
+    RootTableFields base;
+    RootTableFields parts;
 };
 struct Span {
     std::uint64_t begin;
@@ -134,7 +140,8 @@ static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<R
 static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
 static_assert(std::is_standard_layout_v<IndexHeader> && sizeof(IndexHeader) == 16 && offsetof(IndexHeader, buckets) == 8 && offsetof(IndexHeader, shift) == 12);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
-static_assert(std::is_standard_layout_v<Root> && sizeof(Root) == 48 && offsetof(Root, base) == 16 && offsetof(Root, parts) == 24 && offsetof(Root, baseWords) == 32 && sizeof(Span) == 16);
+static_assert(std::is_standard_layout_v<Root> && sizeof(RootTableFields) == 32 && sizeof(Root) == 80 && offsetof(Root, base) == 16 && offsetof(Root, parts) == 48);
+static_assert(offsetof(RootTableFields, indexBase) == 8 && offsetof(RootTableFields, count) == 16 && offsetof(RootTableFields, reserved) == 20 && offsetof(RootTableFields, buckets) == 24 && offsetof(RootTableFields, shift) == 28);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24 && offsetof(Fault, otherFaults) == 28);
 
 inline constexpr std::uint32_t WrittenPageShift = 12;

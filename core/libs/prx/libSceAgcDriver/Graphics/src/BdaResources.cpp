@@ -410,7 +410,15 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     rootBytes = partsAt + partsBytes;
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     root = std::make_shared<Buffer>(context, rootBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-    const Root head{{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(spanCount), sizeof(Span), ShaderRecompiler::BdaAbi::RootTable}, table->DeviceAddress(), root->DeviceAddress() + partsAt, static_cast<std::uint32_t>(tableBytes / sizeof(std::uint32_t)), static_cast<std::uint32_t>(partsBytes / sizeof(std::uint32_t)), 0u};
+    using IndexHeader = ShaderRecompiler::BdaAbi::IndexHeader;
+    Header baseHeader{};
+    std::memcpy(&baseHeader, table->Bytes().data(), sizeof(baseHeader));
+    IndexHeader baseIndex{};
+    if (baseHeader.reserved == ShaderRecompiler::BdaAbi::IndexedTable) std::memcpy(&baseIndex, table->Bytes().data() + sizeof(Header) + baseHeader.count * sizeof(Range), sizeof(baseIndex));
+    Require((table->DeviceAddress() | root->DeviceAddress() | partsAt) % alignof(Range) == 0u, "a BDA table is not aligned for its ranges");
+    const Root head{{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(spanCount), sizeof(Span), ShaderRecompiler::BdaAbi::RootTable},
+                    {table->DeviceAddress(), baseIndex.base, baseHeader.count, baseHeader.reserved, baseIndex.buckets, baseIndex.shift},
+                    {root->DeviceAddress() + partsAt, 0u, static_cast<std::uint32_t>(partCount), 0u, 0u, 0u}};
     auto* bytes = root->Bytes().data();
     std::memcpy(bytes, &head, sizeof(head));
     const Header partsHeader{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(partCount), sizeof(Range), 0u};
