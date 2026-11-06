@@ -38,6 +38,7 @@ struct TranslateOptions {
     bool nativeF16Fma = false;
     bool float32FlushToZero = false;
     bool hardwareNanResults = false;
+    bool hardwareFloatOps = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;

@@ -334,6 +334,10 @@ struct SpirvTarget {
     // source or invalid operation gives NaN either way; only which NaN encoding comes out can differ, so this
     // is for AMD hosts, where the rest of the arithmetic matches the guest's (APS5_NO_HARDWARE_NAN=1 off).
     bool hardwareNanResults = false;
+    // f32 rcp, rsq, sqrt, log, exp, fract, rounding, sin, cos, med3 and output modifiers use the device's own form:
+    // on an AMD host these lower to the instructions the guest named, so the exact forms only repeat them
+    // (APS5_NO_HARDWARE_FLOAT_OPS=1 off).
+    bool hardwareFloatOps = false;
     // Storage images that only load and store texels get heap cases: with the HeapImageMode selector the driver binds
     // no image and the shader reads and writes the T#'s tiled guest bytes through the BDA page table
     // (PipelineSpecialization::HeapImageMode; the driver sets it, APS5_NO_HEAP_STORAGE=1 clears it).

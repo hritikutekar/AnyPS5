@@ -599,6 +599,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         context.SetNativeF16Fma(options.nativeFloat16 && options.nativeF16Fma);
         context.SetFloat32FlushToZero(options.float32FlushToZero);
         context.SetHardwareNanResults(options.hardwareNanResults);
+        context.SetHardwareFloatOps(options.hardwareFloatOps);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];

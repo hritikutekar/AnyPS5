@@ -4184,6 +4184,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     // f32 NaN tests on the bits as one unordered compare on AMD hosts (SpirvTarget::nativeF32IsNan); APS5_NO_NATIVE_ISNAN=1 off.
     target.nativeF32IsNan = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_NATIVE_ISNAN") == nullptr;
     target.hardwareNanResults = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_HARDWARE_NAN") == nullptr;
+    target.hardwareFloatOps = state->properties.vendorID == 0x1002u && std::getenv("APS5_NO_HARDWARE_FLOAT_OPS") == nullptr;
     // Storage images that only load and store texels get heap cases (SpirvTarget::heapStorageImages); the driver
     // selects them with APS5_HEAP_STORAGE=1 (ResourceMaterializer::HeapImageSelectionFor). APS5_NO_HEAP_STORAGE=1 off.
     target.heapStorageImages = std::getenv("APS5_NO_HEAP_STORAGE") == nullptr;

@@ -28,6 +28,7 @@ public:
     void SetNativeF16Fma(bool enabled) { nativeF16Fma = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetHardwareNanResults(bool enabled) { hardwareNanResults = enabled; }
+    void SetHardwareFloatOps(bool enabled) { hardwareFloatOps = enabled; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
@@ -392,6 +393,7 @@ private:
     std::uint32_t f32DenormalFlush = 0u;
     bool float32FlushToZero = false;
     bool hardwareNanResults = false;
+    bool hardwareFloatOps = false;
     std::uint32_t currentProgramCounter = 0;
     std::uint32_t currentVectorLimit = 1;
 };

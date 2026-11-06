@@ -622,6 +622,10 @@ bool TranslationContext::vDivFixupF32(const RdnaInstruction& inst) {
 bool TranslationContext::floatUnary(const RdnaInstruction& inst, IrOpcode opcode) {
     const IrU32 bits = flushF32Denormal(readU32(sourceAt(inst, 0u)));
     const IrF32 argument(ir.BitCastF32(bits.Value()));
+    if (hardwareFloatOps && opcode != IrOpcode::FPSin && opcode != IrOpcode::FPCos) {
+        writeOperand(inst.destination, &ir.Emit(opcode, IrType::F32, {&argument.Value()}));
+        return true;
+    }
     const auto [result, invalid] = unaryFloatSpecials(opcode, argument, IrF32(ir.Emit(opcode, IrType::F32, {&argument.Value()})));
     const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
     const IrU32 special(ir.Select(nan.Value(), quietNan32(bits).Value(), ir.Constant(0xffc00000u)));

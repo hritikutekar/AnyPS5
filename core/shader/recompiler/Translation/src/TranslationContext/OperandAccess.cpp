@@ -381,6 +381,7 @@ std::array<IrU32, 2> TranslationContext::quietNan64(const std::array<IrU32, 2>& 
 }
 
 IrF32 TranslationContext::scaleF32Result(std::uint32_t omod, IrF32 value) {
+    if (hardwareFloatOps) return IrF32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&value.Value(), &ir.ConstantF32(omod == 1u ? 2.0f : omod == 2u ? 4.0f : 0.5f)}));
     IrValue& bits = ir.BitCastU32(value.Value());
     IrValue& magnitude = ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu));
     IrValue& sign = ir.BitwiseAnd(bits, ir.Constant(0x80000000u));

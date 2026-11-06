@@ -297,6 +297,7 @@ private:
         append(key, value.nativeF32MinMax);
         append(key, value.nativeF32IsNan);
         append(key, value.hardwareNanResults);
+        append(key, value.hardwareFloatOps);
         append(key, value.heapStorageImages);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
