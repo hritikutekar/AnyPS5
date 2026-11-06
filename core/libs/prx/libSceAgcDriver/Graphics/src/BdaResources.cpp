@@ -199,6 +199,46 @@ void reportBdaBuildTimes() {
     std::fprintf(stderr, "[bda-build] (10 s): table build parts (ms): hash %.0f, candidate scan %.0f, index %.0f, buffer %.0f, copies %.0f, cache entry %.0f\n", ms(t.hashNs), ms(t.scanNs), ms(t.indexNs), ms(t.bufferNs), ms(t.copyNs), ms(t.entryNs));
 }
 
+// APS5_PROFILE_DRAW: which programs run on two-level builds with spans, and how many ([bda-spans], 10 s). Each span is
+// a step of every lookup's scan, and each such build has its own root.
+void noteBdaSpans(std::uint64_t shader, std::uint32_t spans, std::uint32_t parts) {
+    struct Program {
+        std::uint64_t builds = 0, withSpans = 0, spans = 0, parts = 0;
+        std::uint32_t most = 0;
+    };
+    static std::mutex mutex;
+    static std::map<std::uint64_t, Program> programs;
+    static long long lastReport = 0;
+    std::lock_guard lock(mutex);
+    auto& program = programs[shader];
+    ++program.builds;
+    program.withSpans += spans != 0u;
+    program.spans += spans;
+    program.parts += parts;
+    program.most = std::max(program.most, spans);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs - lastReport < 10000) return;
+    lastReport = nowMs;
+    std::vector<std::pair<std::uint64_t, Program>> ordered(programs.begin(), programs.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) { return left.second.builds > right.second.builds; });
+    Program all;
+    for (const auto& [address, each] : ordered) {
+        all.builds += each.builds;
+        all.withSpans += each.withSpans;
+        all.spans += each.spans;
+        all.parts += each.parts;
+        all.most = std::max(all.most, each.most);
+    }
+    std::ostringstream line;
+    line << "[bda-spans] (10 s): " << all.builds << " builds, " << all.withSpans << " with spans, " << all.spans << " spans (most " << all.most << "), " << all.parts << " parts; by program (builds/with spans/spans/most):";
+    for (std::size_t at = 0; at < ordered.size() && at < 16u; ++at) {
+        const auto& each = ordered[at].second;
+        line << " 0x" << std::hex << ordered[at].first << std::dec << " " << each.builds << "/" << each.withSpans << "/" << each.spans << "/" << each.most;
+    }
+    std::fprintf(stderr, "%s\n", line.str().c_str());
+    programs.clear();
+}
+
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
@@ -401,6 +441,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     }
     const auto spanCount = plain ? std::size_t{0} : edits->spans.size();
     const auto partCount = plain ? std::size_t{0} : edits->parts.size();
+    rootSpans = static_cast<std::uint32_t>(spanCount);
+    rootParts = static_cast<std::uint32_t>(partCount);
     if (!plain) {
         Require(ShaderRecompiler::BdaAbi::RangesOrdered(edits->parts.data(), partCount), "BDA parts do not ascend by begin");
         for (const auto& range : edits->parts) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA part lies past the written-page keys");
@@ -463,6 +505,7 @@ bool LoopGuardTripped() {
 
 void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     markWrittenPages();
+    if (root != nullptr && bdaBuildProfiled()) noteBdaSpans(shaderAddress, rootSpans, rootParts);
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));
     if (report.state == ShaderRecompiler::BdaAbi::FaultState::Empty) {
